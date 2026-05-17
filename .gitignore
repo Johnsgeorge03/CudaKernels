@@ -1,0 +1,52 @@
+# Build directories
+build/
+Debug/
+Release/
+bin/
+lib/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+
+# Visual Studio / MSBuild
+*.vcxproj
+*.vcxproj.filters
+*.sln
+.vs/
+*.obj
+*.exe
+*.lib
+*.pdb
+*.ilk
+
+# CUDA
+*.cubin
+*.fatbin
+*.ptx
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Testing
+Testing/
+*.log
