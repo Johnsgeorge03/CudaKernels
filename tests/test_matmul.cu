@@ -58,6 +58,7 @@ int main()
     std::vector<float> h_B(sizeB);
     std::vector<float> h_C_naive(sizeC);
     std::vector<float> h_C_tiled(sizeC);
+    std::vector<float> h_C_register_tiled(sizeC);
     std::vector<float> h_C_ref(sizeC);
 
     for (int i = 0; i < sizeA; ++i) {
@@ -93,7 +94,7 @@ int main()
                                       h_C_ref.data(),
                                       sizeC);
 
-    launchMatMulTiled(d_A, d_B, d_C, A_rows, A_cols, B_cols);
+    launchMatMulSharedTiled(d_A, d_B, d_C, A_rows, A_cols, B_cols);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -104,12 +105,24 @@ int main()
                                       h_C_ref.data(),
                                       sizeC);
 
+    launchMatMulRegisterTiled(d_A, d_B, d_C, A_rows, A_cols, B_cols);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_C_register_tiled.data(), d_C, sizeC * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    bool registerTiledPassed = compareResults(h_C_register_tiled.data(),
+                                              h_C_ref.data(),
+                                              sizeC);
+
     std::printf("Naive matmul: %s\n", naivePassed ? "PASSED" : "FAILED");
     std::printf("Tiled matmul: %s\n", tiledPassed ? "PASSED" : "FAILED");
+    std::printf("Register-tiled matmul: %s\n", registerTiledPassed ? "PASSED" : "FAILED");
 
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
 
-    return (naivePassed && tiledPassed) ? 0 : 1;
+    return (naivePassed && tiledPassed && registerTiledPassed) ? 0 : 1;
 }

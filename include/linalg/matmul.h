@@ -13,7 +13,14 @@ void launchMatMulNaive(const float* d_A,
                       int B_cols);
 
 // C = A * B
-void launchMatMulTiled(const float* d_A, 
+void launchMatMulSharedTiled(const float* d_A, 
+                      const float* d_B, 
+                      float* d_C, 
+                      int A_rows, 
+                      int A_cols, 
+                      int B_cols);
+
+void launchMatMulRegisterTiled(const float* d_A, 
                       const float* d_B, 
                       float* d_C, 
                       int A_rows, 
