@@ -70,6 +70,7 @@ endfunction()
 set(LINALG_SOURCES
     src/linalg/matmul_naive.cu
     src/linalg/matmul_tiled.cu
+    src/linalg/dotprod.cu
 )
 
 set(LINALG_OBJS)
@@ -118,6 +119,26 @@ target_link_libraries(test_matmul cuda_kernels "${CUDA_ROOT}/lib/x64/cudart.lib"
 target_include_directories(test_matmul PRIVATE ${PROJECT_SOURCE_DIR}/include ${CUDA_ROOT}/include)
 set_target_properties(test_matmul PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME MatMulTest COMMAND test_matmul)
+
+set(DOTPROD_TEST_OBJ "${CMAKE_CURRENT_BINARY_DIR}/test_dotprod.obj")
+
+add_custom_command(
+    OUTPUT ${DOTPROD_TEST_OBJ}
+    COMMAND ${NVCC_EXECUTABLE} -c tests/test_dotprod.cu -o ${DOTPROD_TEST_OBJ}
+            -I${PROJECT_SOURCE_DIR}/include
+            -I${CUDA_ROOT}/include
+            -arch=${CUDA_ARCH}
+            -std=c++17
+    DEPENDS tests/test_dotprod.cu
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    VERBATIM
+)
+
+add_executable(test_dotprod ${DOTPROD_TEST_OBJ})
+target_link_libraries(test_dotprod cuda_kernels "${CUDA_ROOT}/lib/x64/cudart.lib")
+target_include_directories(test_dotprod PRIVATE ${PROJECT_SOURCE_DIR}/include ${CUDA_ROOT}/include)
+set_target_properties(test_dotprod PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME DotProdTest COMMAND test_dotprod)
 
 # ============================================================================
 # Build options
