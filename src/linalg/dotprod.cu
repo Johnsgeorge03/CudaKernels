@@ -43,9 +43,12 @@ __global__ void dotProdKernel(const float* A,
 
 }
 
+// d_C is an accumulator: blocks atomicAdd into it, so this launcher zeroes
+// it first. Callers must not pre-fill d_C (unlike the matmul launchers,
+// which overwrite their output).
 void launchDotProd(const float* d_A,
-                    const float* d_B, 
-                    float* d_C, 
+                    const float* d_B,
+                    float* d_C,
                     int N)
 {
     int gridSize = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;

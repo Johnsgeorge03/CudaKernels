@@ -1,9 +1,8 @@
 #include "core/cuda_utils.h"
 #include "linalg/matmul.h"
+#include "test_utils.h"
 
-#include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <vector>
 
 void matMulCPU(const float* A,
@@ -26,26 +25,9 @@ void matMulCPU(const float* A,
     }
 }
 
-bool compareResults(const float* gpu,
-                    const float* cpu,
-                    int size,
-                    float tolerance = 1e-3f)
-{
-    for (int i = 0; i < size; ++i) {
-        float diff = std::fabs(gpu[i] - cpu[i]);
-
-        if (diff > tolerance) {
-            std::printf("Mismatch at %d: GPU = %f, CPU = %f, diff = %f\n",
-                        i, gpu[i], cpu[i], diff);
-            return false;
-        }
-    }
-
-    return true;
-}
-
 int main()
 {
+    // ---- Correctness (small size, verified against CPU) --------------------
     int A_rows = 128;
     int A_cols = 96;
     int B_cols = 64;
@@ -56,9 +38,7 @@ int main()
 
     std::vector<float> h_A(sizeA);
     std::vector<float> h_B(sizeB);
-    std::vector<float> h_C_naive(sizeC);
-    std::vector<float> h_C_tiled(sizeC);
-    std::vector<float> h_C_register_tiled(sizeC);
+    std::vector<float> h_C(sizeC);
     std::vector<float> h_C_ref(sizeC);
 
     for (int i = 0; i < sizeA; ++i) {
@@ -83,46 +63,63 @@ int main()
     matMulCPU(h_A.data(), h_B.data(), h_C_ref.data(),
               A_rows, A_cols, B_cols);
 
-    launchMatMulNaive(d_A, d_B, d_C, A_rows, A_cols, B_cols);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    struct Variant {
+        const char* name;
+        void (*launch)(const float*, const float*, float*, int, int, int);
+    };
 
-    CUDA_CHECK(cudaMemcpy(h_C_naive.data(), d_C, sizeC * sizeof(float),
-                          cudaMemcpyDeviceToHost));
+    const Variant variants[] = {
+        { "matmul naive",          launchMatMulNaive },
+        { "matmul shared tiled",   launchMatMulSharedTiled },
+        { "matmul register tiled", launchMatMulRegisterTiled },
+    };
 
-    bool naivePassed = compareResults(h_C_naive.data(),
-                                      h_C_ref.data(),
-                                      sizeC);
+    bool allPassed = true;
+    for (const Variant& v : variants) {
+        v.launch(d_A, d_B, d_C, A_rows, A_cols, B_cols);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    launchMatMulSharedTiled(d_A, d_B, d_C, A_rows, A_cols, B_cols);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, sizeC * sizeof(float),
+                              cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(h_C_tiled.data(), d_C, sizeC * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-
-    bool tiledPassed = compareResults(h_C_tiled.data(),
-                                      h_C_ref.data(),
-                                      sizeC);
-
-    launchMatMulRegisterTiled(d_A, d_B, d_C, A_rows, A_cols, B_cols);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_C_register_tiled.data(), d_C, sizeC * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-
-    bool registerTiledPassed = compareResults(h_C_register_tiled.data(),
-                                              h_C_ref.data(),
-                                              sizeC);
-
-    std::printf("Naive matmul: %s\n", naivePassed ? "PASSED" : "FAILED");
-    std::printf("Tiled matmul: %s\n", tiledPassed ? "PASSED" : "FAILED");
-    std::printf("Register-tiled matmul: %s\n", registerTiledPassed ? "PASSED" : "FAILED");
+        bool passed = compareResults(h_C.data(), h_C_ref.data(), sizeC);
+        std::printf("%-28s %s\n", v.name, passed ? "PASSED" : "FAILED");
+        allPassed = allPassed && passed;
+    }
 
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
 
-    return (naivePassed && tiledPassed && registerTiledPassed) ? 0 : 1;
+    // ---- Performance (larger size; correctness already verified above) -----
+    // Compute-bound kernel: report GFLOP/s (2 * M * K * N flops per matmul).
+    int M = 1024, K = 1024, N = 1024;
+
+    std::vector<float> h_PA(M * K);
+    std::vector<float> h_PB(K * N);
+    for (int i = 0; i < M * K; ++i) h_PA[i] = static_cast<float>((i % 7) + 1);
+    for (int i = 0; i < K * N; ++i) h_PB[i] = static_cast<float>((i % 5) + 1);
+
+    float *d_PA, *d_PB, *d_PC;
+    CUDA_CHECK(cudaMalloc(&d_PA, M * K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_PB, K * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_PC, M * N * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_PA, h_PA.data(), M * K * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_PB, h_PB.data(), K * N * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    double flops = 2.0 * M * K * N;
+    for (const Variant& v : variants) {
+        double ms = benchmarkMs(
+            [&] { v.launch(d_PA, d_PB, d_PC, M, K, N); }, 10, 3);
+        reportPerf(v.name, ms, 0.0, flops);
+    }
+
+    CUDA_CHECK(cudaFree(d_PA));
+    CUDA_CHECK(cudaFree(d_PB));
+    CUDA_CHECK(cudaFree(d_PC));
+
+    return allPassed ? 0 : 1;
 }
