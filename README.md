@@ -85,7 +85,9 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 
 ## Performance Notes (measured)
 
-GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift with thermals, so timings use the median of several samples.
+![Kernel throughput](docs/perf.png)
+
+GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift with thermals, so timings use the median of several samples. To regenerate the chart above after a benchmark run: `python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900 --out docs/perf.png`.
 
 - **Dot product** (N = 16.7M floats): ~130–138 GB/s effective bandwidth (~70% of spec peak). The kernel is memory-bound; the reduction itself (warp shuffles + one `__syncthreads()`) is not the bottleneck.
   - `float4` vectorized loads **regressed ~5%** — coalesced scalar loads already saturate transaction width on Pascal, and the wider loads reduced loads-in-flight.

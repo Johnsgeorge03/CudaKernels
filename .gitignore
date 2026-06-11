@@ -47,8 +47,8 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Generated benchmark charts
-perf.png
+# Generated benchmark chart at repo root (the committed copy lives in docs/)
+/perf.png
 
 # Testing
 Testing/
