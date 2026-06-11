@@ -11,6 +11,8 @@ A collection of optimized CUDA kernel implementations for numerical operations, 
 - **Dot Product** (`src/linalg/dotprod.cu`)
   - Grid-stride loads, warp-shuffle reduction, block reduction, atomic finish
 
+An interactive step-through visualization of how the register-tiled matmul kernel works (cooperative tile loads, barriers, per-thread 2x2 accumulation) is in [docs/register_tiled_matmul_viz.html](docs/register_tiled_matmul_viz.html) — download and open in a browser.
+
 ## Requirements
 
 - **CUDA Toolkit** (v12.0+) — https://developer.nvidia.com/cuda-downloads
@@ -80,6 +82,9 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   └── test_dotprod.cu
 ├── scripts/
 │   └── plot_perf.py             # benchmark visualization (matplotlib)
+├── docs/
+│   ├── perf.png                 # benchmark chart (generated)
+│   └── register_tiled_matmul_viz.html   # interactive kernel walkthrough
 └── CMakeLists.txt
 ```
 

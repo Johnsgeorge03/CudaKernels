@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Register-Tiled MatMul — Interactive Visualization</title>
+<style>
+  :root {
+    --a-tile:   #cfe3ff;  --a-strong: #2b6fdb;
+    --b-tile:   #d2f0d6;  --b-strong: #2e9e4f;
+    --c-tile:   #ffe7c7;  --c-strong: #e8821a;
+    --read:     #b13bd8;
+    --grid-line:#d8dce3;
+  }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 20px 28px 48px;
+    background: #f6f7fa; color: #222;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #555; margin: 0 0 16px; font-size: 14px; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 16px;
+  }
+  .controls button {
+    font-size: 15px; padding: 6px 14px; border-radius: 8px;
+    border: 1px solid #c8cdd6; background: #fff; cursor: pointer;
+  }
+  .controls button:hover { background: #eef1f6; }
+  .controls button.primary { background: #2b6fdb; color: #fff; border-color: #2b6fdb; }
+  .controls label { font-size: 13px; color: #444; }
+  .controls select { font-size: 13px; padding: 3px 6px; }
+  #phaseText {
+    background: #fff; border-left: 4px solid #2b6fdb; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 14px; min-height: 38px;
+  }
+  #phaseText b { color: #2b6fdb; }
+  .layout { display: flex; gap: 24px; flex-wrap: wrap; }
+  .panel {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 12px 16px 16px;
+  }
+  .panel h3 { margin: 0 0 8px; font-size: 13px; color: #444; font-weight: 600; }
+  .matrices { display: flex; gap: 22px; flex-wrap: wrap; }
+  .grid { display: grid; gap: 1px; background: var(--grid-line); width: max-content; border: 1px solid var(--grid-line); }
+  .cell {
+    width: 16px; height: 16px; background: #fff;
+    transition: background 0.12s;
+  }
+  .cell.atile  { background: var(--a-tile); }
+  .cell.btile  { background: var(--b-tile); }
+  .cell.ctile  { background: var(--c-tile); }
+  .cell.astrong{ background: var(--a-strong); }
+  .cell.bstrong{ background: var(--b-strong); }
+  .cell.cstrong{ background: var(--c-strong); }
+  .cell.read   { background: var(--read); }
+  .smem-row { display: flex; gap: 26px; margin-top: 14px; flex-wrap: wrap; }
+  .smem .cell { width: 22px; height: 22px; }
+  .sidecol { display: flex; flex-direction: column; gap: 16px; min-width: 360px; flex: 1; }
+  pre.code {
+    margin: 0; font-family: Consolas, "Cascadia Code", monospace;
+    font-size: 12.5px; line-height: 1.55; overflow-x: auto;
+  }
+  pre.code .ln { display: block; padding: 0 8px; border-radius: 4px; white-space: pre; }
+  pre.code .ln.active { background: #fff3bf; outline: 1px solid #e6c200; }
+  .accums { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .acc {
+    border: 1px solid #e1e4ea; border-radius: 8px; padding: 8px 10px;
+    font-family: Consolas, monospace; font-size: 13px;
+  }
+  .acc .bar { height: 6px; background: #edf0f4; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .acc .bar > div { height: 100%; background: var(--c-strong); width: 0%; transition: width 0.15s; }
+  .threadpick { display: grid; grid-template-columns: repeat(4, 26px); gap: 3px; width: max-content; }
+  .threadpick div {
+    width: 26px; height: 26px; border: 1px solid #c8cdd6; border-radius: 5px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    font-size: 10px; color: #777; background: #fff;
+  }
+  .threadpick div:hover { background: #eef1f6; }
+  .threadpick div.sel { background: var(--c-strong); color: #fff; border-color: var(--c-strong); }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: #444; margin-top: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  .why {
+    margin-top: 26px; background: #fff; border: 1px solid #e1e4ea;
+    border-radius: 10px; padding: 16px 22px; max-width: 980px; font-size: 14px; line-height: 1.6;
+  }
+  .why h2 { font-size: 17px; margin-top: 0; }
+  .why table { border-collapse: collapse; margin: 10px 0; }
+  .why td, .why th { border: 1px solid #d8dce3; padding: 6px 12px; font-size: 13px; text-align: center; }
+  .why th { background: #f0f2f6; }
+  .gridlabel { font-size: 11px; color: #888; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>Register-Tiled Matrix Multiplication</h1>
+<p class="subtitle">
+  Scaled-down model of <code>matMulSharedRegisterTiledKernel</code>: TILE_WIDTH = 4 (real kernel: 16),
+  16&times;16 matrices, 4&times;4 threads per block, each thread computes a <b>2&times;2 of outputs</b>.
+  The structure is identical to the real kernel &mdash; only the sizes are smaller.
+</p>
+
+<div class="controls">
+  <button id="btnReset" title="Reset">&#9198;</button>
+  <button id="btnBack"  title="Step back">&#9664;</button>
+  <button id="btnStep"  class="primary" title="Step forward">Step &#9654;</button>
+  <button id="btnPlay"  title="Play / pause">Play &#9654;&#9654;</button>
+  <label>Speed <input id="speed" type="range" min="100" max="1200" value="500" style="vertical-align:middle"></label>
+  <label>Block:
+    <select id="blockSel">
+      <option value="0,0">blockIdx (0,0)</option>
+      <option value="1,0">blockIdx (1,0)</option>
+      <option value="0,1">blockIdx (0,1)</option>
+      <option value="1,1" selected>blockIdx (1,1)</option>
+    </select>
+  </label>
+  <span style="font-size:13px;color:#444">Followed thread (tx,ty): <b id="threadLabel"></b> &mdash; click to change:</span>
+  <div class="threadpick" id="threadPick"></div>
+</div>
+
+<div id="phaseText"></div>
+
+<div class="layout">
+  <div class="panel">
+    <div class="matrices">
+      <div>
+        <h3>A (16&times;16) &mdash; global memory</h3>
+        <div class="grid" id="gridA" style="grid-template-columns: repeat(16, 16px);"></div>
+      </div>
+      <div>
+        <h3>B (16&times;16) &mdash; global memory</h3>
+        <div class="grid" id="gridB" style="grid-template-columns: repeat(16, 16px);"></div>
+      </div>
+      <div>
+        <h3>C (16&times;16) &mdash; output</h3>
+        <div class="grid" id="gridC" style="grid-template-columns: repeat(16, 16px);"></div>
+      </div>
+    </div>
+    <div class="smem-row">
+      <div class="smem">
+        <h3>Ads &mdash; shared memory (8&times;4)</h3>
+        <div class="grid" id="gridAds" style="grid-template-columns: repeat(4, 22px);"></div>
+        <div class="gridlabel">__shared__ float Ads[2*TW][TW]</div>
+      </div>
+      <div class="smem">
+        <h3>Bds &mdash; shared memory (4&times;8)</h3>
+        <div class="grid" id="gridBds" style="grid-template-columns: repeat(8, 22px);"></div>
+        <div class="gridlabel">__shared__ float Bds[TW][2*TW]</div>
+      </div>
+      <div style="flex:1; min-width:230px;">
+        <h3>Followed thread's accumulators (registers)</h3>
+        <div class="accums">
+          <div class="acc" id="acc00">c00 <span></span><div class="bar"><div></div></div></div>
+          <div class="acc" id="acc01">c01 <span></span><div class="bar"><div></div></div></div>
+          <div class="acc" id="acc10">c10 <span></span><div class="bar"><div></div></div></div>
+          <div class="acc" id="acc11">c11 <span></span><div class="bar"><div></div></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--a-tile)"></i> A tile loaded by block</span>
+      <span><i style="background:var(--a-strong)"></i> followed thread's A loads</span>
+      <span><i style="background:var(--b-tile)"></i> B tile loaded by block</span>
+      <span><i style="background:var(--b-strong)"></i> followed thread's B loads</span>
+      <span><i style="background:var(--c-tile)"></i> block's C tile (8&times;8)</span>
+      <span><i style="background:var(--c-strong)"></i> followed thread's 2&times;2 outputs</span>
+      <span><i style="background:var(--read)"></i> shared-mem cells read at step k</span>
+    </div>
+  </div>
+
+  <div class="sidecol">
+    <div class="panel">
+      <h3>Kernel (current line highlighted)</h3>
+      <pre class="code" id="codePane"></pre>
+    </div>
+  </div>
+</div>
+
+<div class="why">
+  <h2>Why 2&times;2 outputs per thread is faster</h2>
+  <p>
+    In the compute loop, look at what the followed thread reads at each <code>k</code>
+    (purple cells): <b>2 values from Ads and 2 from Bds &mdash; and it does 4 multiply-adds with them.</b>
+    Every shared-memory value it reads is used <b>twice</b>: <code>Ads[ty][k]</code> feeds both
+    <code>c00</code> and <code>c01</code>; <code>Bds[k][tx]</code> feeds both <code>c00</code> and <code>c10</code>.
+  </p>
+  <table>
+    <tr><th></th><th>shared loads per k</th><th>FMAs per k</th><th>FMA / load</th></tr>
+    <tr><td>simple tiled (1 output/thread)</td><td>2</td><td>1</td><td>0.5</td></tr>
+    <tr><td>register tiled (2&times;2 outputs)</td><td>4</td><td>4</td><td><b>1.0</b></td></tr>
+  </table>
+  <p>
+    Doubling FMAs per shared-memory access matters because shared memory, while fast, still has
+    finite bandwidth and latency &mdash; registers are the only storage that keeps up with the ALUs.
+    The accumulators <code>c00..c11</code> live in registers for the whole kernel, so the inner loop's
+    products land in the fastest storage available. Larger register tiles (4&times;4 = 16 outputs/thread)
+    push the ratio higher still &mdash; until register pressure starts hurting occupancy, which is the
+    trade-off that bounds this technique.
+  </p>
+  <p style="color:#666">
+    Mapping to the real kernel: TILE_WIDTH 4 &rarr; 16, block 4&times;4 &rarr; 16&times;16 threads,
+    C tile 8&times;8 &rarr; 32&times;32, inner k-loop 4 &rarr; 16 steps. Nothing else changes.
+  </p>
+</div>
+
+<script>
+const TW = 4;              // tile width (real kernel: 16)
+const Nmat = 16;           // matrix dimension
+const numTiles = Nmat / TW;
+
+// ---- kernel source shown in the code pane, with phase tags -----------------
+const codeLines = [
+  { tag: null,    text: "__global__ void matMulRegisterTiled(...) {" },
+  { tag: null,    text: "  __shared__ float Ads[2*TW][TW];" },
+  { tag: null,    text: "  __shared__ float Bds[TW][2*TW];" },
+  { tag: null,    text: "  float c00=0, c01=0, c10=0, c11=0;" },
+  { tag: "tloop", text: "  for (int t = 0; t < numTiles; t++) {" },
+  { tag: "load",  text: "    Ads[ty][tx]      = A[row0][t*TW+tx];" },
+  { tag: "load",  text: "    Ads[ty+TW][tx]   = A[row1][t*TW+tx];" },
+  { tag: "load",  text: "    Bds[ty][tx]      = B[t*TW+ty][col0];" },
+  { tag: "load",  text: "    Bds[ty][tx+TW]   = B[t*TW+ty][col1];" },
+  { tag: "sync1", text: "    __syncthreads();" },
+  { tag: "kloop", text: "    for (int k = 0; k < TW; k++) {" },
+  { tag: "comp",  text: "      c00 += Ads[ty][k]    * Bds[k][tx];" },
+  { tag: "comp",  text: "      c01 += Ads[ty][k]    * Bds[k][tx+TW];" },
+  { tag: "comp",  text: "      c10 += Ads[ty+TW][k] * Bds[k][tx];" },
+  { tag: "comp",  text: "      c11 += Ads[ty+TW][k] * Bds[k][tx+TW];" },
+  { tag: "kloop", text: "    }" },
+  { tag: "sync2", text: "    __syncthreads();" },
+  { tag: "tloop", text: "  }" },
+  { tag: "write", text: "  C[row0][col0]=c00;  C[row0][col1]=c01;" },
+  { tag: "write", text: "  C[row1][col0]=c10;  C[row1][col1]=c11;" },
+  { tag: null,    text: "}" },
+];
+
+// ---- state machine: the sequence of phases the kernel walks through --------
+const states = [];
+for (let t = 0; t < numTiles; t++) {
+  states.push({ type: "load", t });
+  states.push({ type: "sync1", t });
+  for (let k = 0; k < TW; k++) states.push({ type: "compute", t, k });
+  states.push({ type: "sync2", t });
+}
+states.push({ type: "write" });
+
+let idx = 0;
+let bx = 1, by = 1;        // selected block
+let tx = 1, ty = 1;        // followed thread
+let playing = false, timer = null;
+
+// ---- build the DOM grids ----------------------------------------------------
+function buildGrid(id, rows, cols) {
+  const g = document.getElementById(id);
+  g.innerHTML = "";
+  const cells = [];
+  for (let r = 0; r < rows; r++) {
+    cells.push([]);
+    for (let c = 0; c < cols; c++) {
+      const d = document.createElement("div");
+      d.className = "cell";
+      g.appendChild(d);
+      cells[r].push(d);
+    }
+  }
+  return cells;
+}
+const A   = buildGrid("gridA", Nmat, Nmat);
+const B   = buildGrid("gridB", Nmat, Nmat);
+const C   = buildGrid("gridC", Nmat, Nmat);
+const Ads = buildGrid("gridAds", 2 * TW, TW);
+const Bds = buildGrid("gridBds", TW, 2 * TW);
+
+// thread picker
+const pick = document.getElementById("threadPick");
+const pickCells = [];
+for (let r = 0; r < TW; r++) {
+  pickCells.push([]);
+  for (let c = 0; c < TW; c++) {
+    const d = document.createElement("div");
+    d.textContent = c + "," + r;
+    d.onclick = () => { tx = c; ty = r; render(); };
+    pick.appendChild(d);
+    pickCells[r].push(d);
+  }
+}
+
+// code pane
+const codePane = document.getElementById("codePane");
+codeLines.forEach(l => {
+  const s = document.createElement("span");
+  s.className = "ln";
+  s.textContent = l.text;
+  codePane.appendChild(s);
+});
+const codeEls = codePane.querySelectorAll(".ln");
+
+function setCodeHighlight(tags) {
+  codeEls.forEach((el, i) =>
+    el.classList.toggle("active", tags.includes(codeLines[i].tag)));
+}
+
+// ---- rendering --------------------------------------------------------------
+function clearAll(cells) {
+  for (const row of cells) for (const d of row)
+    d.className = "cell";
+}
+
+function threadCoords() {
+  const row0 = by * 2 * TW + ty, row1 = row0 + TW;
+  const col0 = bx * 2 * TW + tx, col1 = col0 + TW;
+  return { row0, row1, col0, col1 };
+}
+
+function render() {
+  const st = states[idx];
+  const { row0, row1, col0, col1 } = threadCoords();
+  clearAll(A); clearAll(B); clearAll(C); clearAll(Ads); clearAll(Bds);
+
+  // C block tile is always visible
+  for (let r = 0; r < 2 * TW; r++)
+    for (let c = 0; c < 2 * TW; c++)
+      C[by * 2 * TW + r][bx * 2 * TW + c].classList.add("ctile");
+  // followed thread's 2x2 outputs
+  for (const [r, c] of [[row0,col0],[row0,col1],[row1,col0],[row1,col1]])
+    C[r][c].classList.add("cstrong");
+
+  const t = st.t ?? numTiles - 1;
+
+  // tile regions in A and B for current t (shown during load/sync/compute)
+  if (st.type !== "write") {
+    for (let r = 0; r < 2 * TW; r++)
+      for (let c = 0; c < TW; c++)
+        A[by * 2 * TW + r][t * TW + c].classList.add("atile");
+    for (let r = 0; r < TW; r++)
+      for (let c = 0; c < 2 * TW; c++)
+        B[t * TW + r][bx * 2 * TW + c].classList.add("btile");
+  }
+
+  let text = "";
+  if (st.type === "load") {
+    // followed thread's 2 A loads and 2 B loads, and where they land in smem
+    A[row0][t * TW + tx].classList.add("astrong");
+    A[row1][t * TW + tx].classList.add("astrong");
+    B[t * TW + ty][col0].classList.add("bstrong");
+    B[t * TW + ty][col1].classList.add("bstrong");
+    Ads[ty][tx].classList.add("astrong");
+    Ads[ty + TW][tx].classList.add("astrong");
+    Bds[ty][tx].classList.add("bstrong");
+    Bds[ty][tx + TW].classList.add("bstrong");
+    setCodeHighlight(["load"]);
+    text = `<b>Tile ${t} &mdash; cooperative load.</b> All 16 threads together fill Ads (8&times;4)
+            and Bds (4&times;8). The followed thread loads <b>2 elements of A</b> and
+            <b>2 elements of B</b> (dark cells) into shared memory. Loads down a column
+            of A and across a row of B stay coalesced across the warp.`;
+  } else if (st.type === "sync1") {
+    setCodeHighlight(["sync1"]);
+    text = `<b>__syncthreads()</b> &mdash; barrier between <i>writing</i> shared memory and
+            <i>reading</i> it. No thread may start computing until every thread's loads
+            have landed, because each thread is about to read values <i>other</i> threads loaded.`;
+  } else if (st.type === "compute") {
+    const k = st.k;
+    // smem cells read by the followed thread at this k
+    Ads[ty][k].classList.add("read");
+    Ads[ty + TW][k].classList.add("read");
+    Bds[k][tx].classList.add("read");
+    Bds[k][tx + TW].classList.add("read");
+    setCodeHighlight(["comp"]);
+    text = `<b>Tile ${t}, k = ${k}.</b> The followed thread reads <b>4 shared-memory values</b>
+            (purple) and performs <b>4 multiply-adds</b> into its registers:
+            each Ads value is reused for 2 outputs, each Bds value for 2 outputs.
+            That reuse &mdash; 4 FMAs per 4 loads instead of 1 FMA per 2 loads &mdash; is the
+            whole point of register tiling.`;
+  } else if (st.type === "sync2") {
+    setCodeHighlight(["sync2"]);
+    text = `<b>__syncthreads()</b> &mdash; barrier between <i>reading</i> the tile and the next
+            iteration <i>overwriting</i> it. A fast thread must not load tile ${t + 1} into
+            Ads/Bds while a slow thread is still reading tile ${t}.`;
+  } else { // write
+    setCodeHighlight(["write"]);
+    text = `<b>Write-back.</b> The k-loop ran over all ${numTiles} tiles; each accumulator now
+            holds a complete dot product of ${Nmat} terms. The thread writes its 2&times;2
+            results from registers to global C &mdash; the only global-memory writes it ever does.`;
+  }
+  document.getElementById("phaseText").innerHTML = text;
+
+  // accumulators: number of terms accumulated so far (same for all four)
+  let terms = 0;
+  for (let i = 0; i <= idx; i++) if (states[i].type === "compute") terms++;
+  for (const id of ["acc00", "acc01", "acc10", "acc11"]) {
+    const el = document.getElementById(id);
+    el.querySelector("span").textContent = ` = ${terms}/${Nmat} terms`;
+    el.querySelector(".bar > div").style.width = (100 * terms / Nmat) + "%";
+  }
+
+  // thread picker highlight + label
+  pickCells.forEach((row, r) => row.forEach((d, c) =>
+    d.classList.toggle("sel", c === tx && r === ty)));
+  document.getElementById("threadLabel").textContent = `(${tx},${ty})`;
+}
+
+// ---- controls ---------------------------------------------------------------
+function step(dir) {
+  idx = Math.max(0, Math.min(states.length - 1, idx + dir));
+  render();
+  if (idx === states.length - 1) stop();
+}
+function stop() {
+  playing = false;
+  clearInterval(timer);
+  document.getElementById("btnPlay").innerHTML = "Play &#9654;&#9654;";
+}
+document.getElementById("btnStep").onclick  = () => { stop(); step(1); };
+document.getElementById("btnBack").onclick  = () => { stop(); step(-1); };
+document.getElementById("btnReset").onclick = () => { stop(); idx = 0; render(); };
+document.getElementById("btnPlay").onclick  = () => {
+  if (playing) { stop(); return; }
+  if (idx === states.length - 1) idx = 0;
+  playing = true;
+  document.getElementById("btnPlay").textContent = "Pause";
+  const tick = () => step(1);
+  timer = setInterval(tick, 1300 - document.getElementById("speed").value);
+};
+document.getElementById("speed").oninput = () => {
+  if (playing) {
+    clearInterval(timer);
+    timer = setInterval(() => step(1), 1300 - document.getElementById("speed").value);
+  }
+};
+document.getElementById("blockSel").onchange = (e) => {
+  const [x, y] = e.target.value.split(",").map(Number);
+  bx = x; by = y;
+  render();
+};
+
+render();
+</script>
+</body>
+</html>
