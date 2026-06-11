@@ -1,142 +1,103 @@
 # CUDA Kernels
 
-A collection of optimized CUDA kernel implementations for linear algebra operations.
+A collection of optimized CUDA kernel implementations for numerical operations, with correctness tests and benchmarks.
 
-## Features
+## Kernels
 
-- **Matrix Multiplication Kernels**
-  - Naive implementation (`matmul_naive.cu`)
-  - Tiled implementation with shared memory optimization (`matmul_tiled.cu`)
+- **Matrix Multiplication** (`src/linalg/matmul_*.cu`)
+  - Naive implementation
+  - Shared-memory tiled implementation
+  - Register-tiled implementation (2x2 outputs per thread)
+- **Dot Product** (`src/linalg/dotprod.cu`)
+  - Grid-stride loads, warp-shuffle reduction, block reduction, atomic finish
 
 ## Requirements
 
-- **CUDA Toolkit** (v12.0+)
-  - Download: https://developer.nvidia.com/cuda-downloads
-  - For older GPUs (pre-Turing), use CUDA 12.x or earlier
-  
-- **MSVC** (Windows) or **GCC** (Linux)
-  - Windows: Visual Studio 2022 Build Tools (free)
-  - Linux: `sudo apt install build-essential`
-
+- **CUDA Toolkit** (v12.0+) — https://developer.nvidia.com/cuda-downloads
+- **MSVC** (Windows, Visual Studio 2022 Build Tools) or **GCC** (Linux)
 - **CMake** (v3.18+)
-  - Download: https://cmake.org/download/
-
-## GPU Compute Capability Reference
-
-Adjust `CUDA_ARCH` in `CMakeLists.txt` for your GPU:
-
-- `sm_61` - GeForce GTX 1060, 1070, 1080, Quadro P5000/P6000
-- `sm_75` - GeForce RTX 2060/2070/2080, Quadro RTX 4000/5000/6000
-- `sm_86` - GeForce RTX 3060/3070/3080/3090
-- `sm_89` - GeForce RTX 4070/4080/4090
 
 ## Building
 
-### Windows (with MSVC)
-
 ```powershell
-# Set CUDA_PATH if not already in PATH
-$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
-
-# Create build directory
-mkdir build
-cd build
-
-# Configure and build
-cmake ..
-cmake --build . --config Release
+cmake -S . -B build
+cmake --build build --config Release
 ```
 
-### Linux (with GCC)
+The GPU architecture defaults to `61` (GTX 1000 series). For a different GPU, pass it at configure time:
 
-```bash
-# Install dependencies (if needed)
-sudo apt install build-essential cmake nvidia-cuda-toolkit
-
-# Create build directory
-mkdir build
-cd build
-
-# Configure and build
-cmake ..
-cmake --build . --config Release
+```powershell
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86   # RTX 3000s
+# 61 = GTX 1000s, 75 = RTX 2000s, 86 = RTX 3000s, 89 = RTX 4000s
+# CMake 3.24+: -DCMAKE_CUDA_ARCHITECTURES=native to auto-detect
 ```
 
 ## Testing
 
-Run the test suite:
+Each test verifies the kernels against a CPU reference, then benchmarks them (median-of-samples timing, reporting GB/s for memory-bound kernels and GFLOP/s for compute-bound ones).
 
 ```powershell
-# Windows
-cd build
-ctest -C Release --verbose
+ctest --test-dir build -C Release --verbose
 
 # Or run directly
-./Release/test_matmul.exe
+./build/Release/test_matmul.exe
+./build/Release/test_dotprod.exe
 ```
 
-```bash
-# Linux
-cd build
-ctest --verbose
-./test_matmul
+## Visualizing Performance
+
+`scripts/plot_perf.py` runs the test binaries, parses their benchmark output, and renders bar charts (one for compute-bound kernels in GFLOP/s, one for memory-bound kernels in GB/s). Requires Python 3.9+ with matplotlib.
+
+```powershell
+python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 ```
+
+`--peak-bw` / `--peak-flops` are your GPU's spec-sheet ceilings and draw the hardware limit on each chart; omit them if you just want the bars. New kernels show up automatically as long as their test prints through `reportPerf` in `tests/test_utils.h`.
+
+## Adding a New Kernel
+
+1. Add `include/<domain>/<kernel>.h` declaring the launch function(s).
+2. Add `src/<domain>/<kernel>.cu` and list it in the `add_library` block in `CMakeLists.txt`.
+3. Add `tests/test_<kernel>.cu` (use the helpers in `tests/test_utils.h`) and register it with one line: `add_kernel_test(test_<kernel>)`.
 
 ## Project Structure
 
 ```
 ├── include/
 │   ├── core/
-│   │   └── cuda_utils.h         # CUDA error handling utilities
+│   │   └── cuda_utils.h         # CUDA_CHECK error handling
 │   └── linalg/
-│       └── matmul.h             # Matrix multiplication kernels
+│       ├── matmul.h
+│       └── dotprod.h
 ├── src/
 │   └── linalg/
-│       ├── matmul_naive.cu      # Naive kernel implementation
-│       └── matmul_tiled.cu      # Tiled kernel implementation
+│       ├── matmul_naive.cu
+│       ├── matmul_tiled.cu      # shared-memory tiled + register tiled
+│       └── dotprod.cu
 ├── tests/
-│   └── test_matmul.cu           # Test suite
-├── benchmarks/                   # (Empty, add benchmarks here)
-├── examples/                     # (Empty, add examples here)
+│   ├── test_utils.h             # shared correctness + benchmark helpers
+│   ├── test_matmul.cu
+│   └── test_dotprod.cu
+├── scripts/
+│   └── plot_perf.py             # benchmark visualization (matplotlib)
 └── CMakeLists.txt
 ```
 
-## Building with Options
+## Performance Notes (measured)
 
-```powershell
-# Build with benchmarks
-cmake .. -DBUILD_BENCHMARKS=ON
+GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift with thermals, so timings use the median of several samples.
 
-# Build with examples
-cmake .. -DBUILD_EXAMPLES=ON
-
-# Build everything
-cmake .. -DBUILD_BENCHMARKS=ON -DBUILD_EXAMPLES=ON
-```
+- **Dot product** (N = 16.7M floats): ~130–138 GB/s effective bandwidth (~70% of spec peak). The kernel is memory-bound; the reduction itself (warp shuffles + one `__syncthreads()`) is not the bottleneck.
+  - `float4` vectorized loads **regressed ~5%** — coalesced scalar loads already saturate transaction width on Pascal, and the wider loads reduced loads-in-flight.
+  - 4x loop unrolling was **neutral** (within run-to-run noise).
+  - Conclusion: the scalar grid-stride kernel is kept as canonical; remaining gap to peak is the practical DRAM ceiling plus thermal throttling, not kernel code.
 
 ## Troubleshooting
 
-### "Unsupported gpu architecture" error
-- Your GPU or CUDA version doesn't support the specified compute capability
-- Update `CUDA_ARCH` in `CMakeLists.txt` to match your GPU
-- Or install a compatible CUDA version
-
-### "no kernel image is available for execution"
-- The compiled binary doesn't support your GPU's architecture
-- Check your GPU's compute capability (use `nvidia-smi`)
-- Update `CUDA_ARCH` and rebuild
-
-### "CUDA toolkit not found"
-- Set `CUDA_PATH` environment variable:
-  ```powershell
-  $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
-  ```
-- Or add CUDA to your system PATH
+- **"Unsupported gpu architecture"** — your CUDA version doesn't support the requested arch; change `CMAKE_CUDA_ARCHITECTURES`.
+- **"no kernel image is available for execution"** — binary built for a different arch than your GPU; check compute capability (`nvidia-smi --query-gpu=compute_cap --format=csv`) and reconfigure.
+- **CUDA not found at configure time** — ensure `nvcc` is on `PATH` or set `CUDA_PATH` to the toolkit root.
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests.
