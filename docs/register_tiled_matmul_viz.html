@@ -82,6 +82,21 @@
   .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: #444; margin-top: 12px; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .legend i { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  .idxref {
+    display: flex; flex-wrap: wrap; gap: 18px; align-items: stretch;
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 12px 16px; margin-bottom: 16px; font-size: 13px;
+  }
+  .idxref .box { flex: 1; min-width: 250px; }
+  .idxref h4 { margin: 0 0 6px; font-size: 13px; }
+  .idxref code { background: #f0f2f6; border-radius: 3px; padding: 0 4px; }
+  .idxref ul { margin: 4px 0 0; padding-left: 18px; }
+  .idxref li { margin: 3px 0; }
+  .idxref .axis { color: var(--c-strong); font-weight: 600; }
+  .idxref .formula {
+    flex-basis: 100%; border-top: 1px dashed var(--grid-line); padding-top: 8px;
+    font-family: Consolas, monospace; font-size: 12.5px; color: #444;
+  }
   .why {
     margin-top: 26px; background: #fff; border: 1px solid #e1e4ea;
     border-radius: 10px; padding: 16px 22px; max-width: 980px; font-size: 14px; line-height: 1.6;
@@ -116,8 +131,34 @@
       <option value="1,1" selected>blockIdx (1,1)</option>
     </select>
   </label>
-  <span style="font-size:13px;color:#444">Followed thread (tx,ty): <b id="threadLabel"></b> &mdash; click to change:</span>
+  <span style="font-size:13px;color:#444">Followed thread (tx,ty): <b id="threadLabel"></b> &mdash; click to change
+    (<span class="axis">tx</span> = horizontal, <span class="axis">ty</span> = vertical):</span>
   <div class="threadpick" id="threadPick"></div>
+</div>
+
+<div class="idxref">
+  <div class="box">
+    <h4><code>blockIdx</code> &mdash; which block (which tile of C)</h4>
+    Convention: <span class="axis">x runs horizontally &rarr; columns</span>,
+    <span class="axis">y runs vertically &darr; rows</span>.
+    <ul>
+      <li><code>blockIdx.x</code> &rarr; horizontal block position &rarr; selects the <b>column band</b> of C</li>
+      <li><code>blockIdx.y</code> &rarr; vertical block position &rarr; selects the <b>row band</b> of C</li>
+    </ul>
+  </div>
+  <div class="box">
+    <h4><code>threadIdx</code> &mdash; which thread inside the block</h4>
+    Each block here is 4&times;4 threads (the picker above).
+    <ul>
+      <li><code>threadIdx.x</code> (<code>tx</code>) &rarr; horizontal position &rarr; <b>column</b> within the block</li>
+      <li><code>threadIdx.y</code> (<code>ty</code>) &rarr; vertical position &rarr; <b>row</b> within the block</li>
+    </ul>
+  </div>
+  <div class="formula">
+    The kernel turns these into C coordinates &mdash; note y/row pair with each other, x/col pair with each other:<br>
+    &nbsp;&nbsp;row0 = blockIdx.<b>y</b> * (2*TW) + <b>ty</b>;&nbsp;&nbsp;&nbsp;col0 = blockIdx.<b>x</b> * (2*TW) + <b>tx</b>;<br>
+    &nbsp;&nbsp;row1 = row0 + TW;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;col1 = col0 + TW;&nbsp;&nbsp;&nbsp;&larr; the 2nd row/col of this thread's 2&times;2
+  </div>
 </div>
 
 <div id="phaseText"></div>
