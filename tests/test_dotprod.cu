@@ -18,6 +18,58 @@ double dotProdCPU(const float* A, const float* B, int N)
     return sum;
 }
 
+typedef void (*DotProdLaunch)(const float*, const float*, float*, int);
+
+// Verifies correctness against the double reference, then reports
+// ms/iter and effective DRAM bandwidth for a given launch function.
+bool benchmark(const char* name,
+               DotProdLaunch launch,
+               const float* d_A,
+               const float* d_B,
+               float* d_C,
+               int N,
+               double ref,
+               int iters)
+{
+    launch(d_A, d_B, d_C, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float h_C = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&h_C, d_C, sizeof(float), cudaMemcpyDeviceToHost));
+
+    double relErr = std::fabs(h_C - ref) / std::fabs(ref);
+    bool passed = relErr < 1e-4;
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    launch(d_A, d_B, d_C, N);            // warmup
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int it = 0; it < iters; ++it) {
+        launch(d_A, d_B, d_C, N);
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    double msPerIter = ms / iters;
+
+    double bytes = 2.0 * static_cast<double>(N) * sizeof(float);
+    double gbPerSec = (bytes / (msPerIter * 1.0e-3)) / 1.0e9;
+
+    std::printf("%-10s %s  relErr = %.2e  | %.4f ms/iter  %.1f GB/s\n",
+                name, passed ? "PASSED" : "FAILED", relErr, msPerIter, gbPerSec);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return passed;
+}
+
 int main()
 {
     const int N = 1 << 24;            // ~16.7M elements
@@ -43,50 +95,11 @@ int main()
     CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), N * sizeof(float),
                           cudaMemcpyHostToDevice));
 
-    // ---- Correctness -------------------------------------------------------
     double ref = dotProdCPU(h_A.data(), h_B.data(), N);
 
-    launchDotProd(d_A, d_B, d_C, N);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    std::printf("N = %d, peak ~192 GB/s\n", N);
+    bool passed = benchmark("scalar", launchDotProd, d_A, d_B, d_C, N, ref, iters);
 
-    float h_C = 0.0f;
-    CUDA_CHECK(cudaMemcpy(&h_C, d_C, sizeof(float), cudaMemcpyDeviceToHost));
-
-    double relErr = std::fabs(h_C - ref) / std::fabs(ref);
-    bool passed = relErr < 1e-4;
-
-    std::printf("Dot product: GPU = %.4f, CPU = %.4f, relErr = %.2e -> %s\n",
-                h_C, ref, relErr, passed ? "PASSED" : "FAILED");
-
-    // ---- Bandwidth ---------------------------------------------------------
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    launchDotProd(d_A, d_B, d_C, N);     // warmup
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaEventRecord(start));
-    for (int it = 0; it < iters; ++it) {
-        launchDotProd(d_A, d_B, d_C, N);
-    }
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    double msPerIter = ms / iters;
-
-    // Read A and read B: 2 floats moved per element.
-    double bytes = 2.0 * static_cast<double>(N) * sizeof(float);
-    double gbPerSec = (bytes / (msPerIter * 1.0e-3)) / 1.0e9;
-
-    std::printf("N = %d, %.4f ms/iter, %.1f GB/s effective bandwidth\n",
-                N, msPerIter, gbPerSec);
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));

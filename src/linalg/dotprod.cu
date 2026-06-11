@@ -32,7 +32,7 @@ __global__ void dotProdKernel(const float* A,
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
-    
+
     float sum = 0.0f;
     for ( int i = idx; i < N; i += stride ){
         sum += A[i] * B[i];
