@@ -10,8 +10,15 @@ A collection of optimized CUDA kernel implementations for numerical operations, 
   - Register-tiled implementation (2x2 outputs per thread)
 - **Dot Product** (`src/linalg/dotprod.cu`)
   - Grid-stride loads, warp-shuffle reduction, block reduction, atomic finish
+- **Matrix Transpose** (`src/linalg/transpose.cu`)
+  - Naive (strided writes)
+  - Shared-memory tiled (coalesced both ways, bank-conflicted)
+  - Padded tile (`[TILE][TILE+1]`, conflict-free)
 
-An interactive step-through visualization of how the register-tiled matmul kernel works (cooperative tile loads, barriers, per-thread 2x2 accumulation) is in [docs/register_tiled_matmul_viz.html](docs/register_tiled_matmul_viz.html) — download and open in a browser.
+Interactive visualizations (download and open in a browser):
+
+- [docs/register_tiled_matmul_viz.html](docs/register_tiled_matmul_viz.html) — step-through of the register-tiled matmul kernel (cooperative tile loads, barriers, per-thread 2x2 accumulation)
+- [docs/bank_conflict_viz.html](docs/bank_conflict_viz.html) — shared-memory bank conflicts and why the +1 padding fixes them (animated bank queues, unpadded vs padded side by side)
 
 ## Requirements
 
@@ -70,21 +77,25 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   │   └── cuda_utils.h         # CUDA_CHECK error handling
 │   └── linalg/
 │       ├── matmul.h
-│       └── dotprod.h
+│       ├── dotprod.h
+│       └── transpose.h
 ├── src/
 │   └── linalg/
 │       ├── matmul_naive.cu
 │       ├── matmul_tiled.cu      # shared-memory tiled + register tiled
-│       └── dotprod.cu
+│       ├── dotprod.cu
+│       └── transpose.cu         # naive + tiled + padded
 ├── tests/
 │   ├── test_utils.h             # shared correctness + benchmark helpers
 │   ├── test_matmul.cu
-│   └── test_dotprod.cu
+│   ├── test_dotprod.cu
+│   └── test_transpose.cu
 ├── scripts/
 │   └── plot_perf.py             # benchmark visualization (matplotlib)
 ├── docs/
 │   ├── perf.png                 # benchmark chart (generated)
-│   └── register_tiled_matmul_viz.html   # interactive kernel walkthrough
+│   ├── register_tiled_matmul_viz.html   # interactive kernel walkthrough
+│   └── bank_conflict_viz.html           # bank conflicts + padding fix
 └── CMakeLists.txt
 ```
 
@@ -98,6 +109,9 @@ GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift 
   - `float4` vectorized loads **regressed ~5%** — coalesced scalar loads already saturate transaction width on Pascal, and the wider loads reduced loads-in-flight.
   - 4x loop unrolling was **neutral** (within run-to-run noise).
   - Conclusion: the scalar grid-stride kernel is kept as canonical; remaining gap to peak is the practical DRAM ceiling plus thermal throttling, not kernel code.
+- **Transpose** (2048 x 4096): naive ~56 GB/s → tiled ~82 GB/s → padded ~139 GB/s (~72% of peak).
+  - Tiled fixes global-write coalescing by staging the swap through shared memory; the gain is capped by a 32-way bank conflict on the transposed shared read.
+  - Padding the tile to `[TILE][TILE+1]` removes the conflict (stride 33 is coprime with the 32 banks) and nearly doubles tiled throughput — the bank-conflict cost, isolated and measured.
 
 ## Troubleshooting
 

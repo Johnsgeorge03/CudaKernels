@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Shared-Memory Bank Conflicts — Interactive Visualization</title>
+<style>
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 20px 28px 48px;
+    background: #f6f7fa; color: #222;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #555; margin: 0 0 16px; font-size: 14px; max-width: 950px; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 16px;
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px; font-size: 13.5px;
+  }
+  .controls button {
+    font-size: 15px; padding: 6px 14px; border-radius: 8px;
+    border: 1px solid #c8cdd6; background: #fff; cursor: pointer;
+  }
+  .controls button:hover { background: #eef1f6; }
+  .controls button.primary { background: #2b6fdb; color: #fff; border-color: #2b6fdb; }
+  .controls label { display: inline-flex; align-items: center; gap: 6px; }
+  .controls code { background: #f0f2f6; border-radius: 3px; padding: 1px 5px; }
+  #cycleLine {
+    background: #fff; border-left: 4px solid #2b6fdb; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 14px; min-height: 22px;
+  }
+  #cycleLine b { color: #2b6fdb; }
+  .panels { display: flex; gap: 22px; flex-wrap: wrap; }
+  .panel {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 14px 18px 18px; flex: 1; min-width: 430px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 2px; font-family: Consolas, monospace; }
+  .panel .verdict { font-size: 13px; margin: 2px 0 12px; font-weight: 600; }
+  .panel.bad  .verdict { color: #c0392b; }
+  .panel.good .verdict { color: #1e8449; }
+  .tilegrid { display: grid; gap: 2px; width: max-content; }
+  .cell {
+    width: 38px; height: 34px; border-radius: 5px; position: relative;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: #667; font-family: Consolas, monospace;
+    border: 1px solid transparent;
+  }
+  .cell.pad {
+    background: repeating-linear-gradient(45deg, #eceef2, #eceef2 4px, #f8f9fb 4px, #f8f9fb 8px) !important;
+    color: #aab;
+  }
+  .cell.hit { border: 2px solid #222; font-weight: 700; color: #111; }
+  .cell.hit.served { opacity: 0.45; }
+  .cell .lane {
+    position: absolute; top: -7px; right: -6px;
+    background: #222; color: #fff; font-size: 9px; border-radius: 7px;
+    padding: 0 4px; line-height: 13px;
+  }
+  .bankrow { display: flex; gap: 6px; margin-top: 16px; }
+  .bank {
+    width: 46px; border: 1px solid #d8dce3; border-radius: 7px;
+    padding: 4px 3px 6px; text-align: center; background: #fafbfd;
+  }
+  .bank .bname { font-size: 10px; color: #889; margin-bottom: 4px; }
+  .bank .chips { display: flex; flex-direction: column-reverse; gap: 3px; min-height: 100px; justify-content: flex-start; }
+  .chip {
+    border-radius: 5px; font-size: 10.5px; line-height: 17px; color: #fff;
+    font-family: Consolas, monospace; font-weight: 700;
+  }
+  .chip.served { opacity: 0.25; text-decoration: line-through; }
+  .formula {
+    margin-top: 14px; font-family: Consolas, monospace; font-size: 12.5px;
+    background: #f7f8fa; border-radius: 7px; padding: 8px 10px; color: #333;
+    line-height: 1.6;
+  }
+  .codebox {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px;
+    font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.6;
+  }
+  .codebox .ln { display: block; padding: 0 8px; border-radius: 4px; white-space: pre; }
+  .codebox .ln.active { background: #fff3bf; outline: 1px solid #e6c200; }
+  .why {
+    margin-top: 26px; background: #fff; border: 1px solid #e1e4ea;
+    border-radius: 10px; padding: 16px 22px; max-width: 980px;
+    font-size: 14px; line-height: 1.6;
+  }
+  .why h2 { font-size: 17px; margin-top: 0; }
+  .why code { background: #f0f2f6; border-radius: 3px; padding: 0 4px; }
+  .why table { border-collapse: collapse; margin: 10px 0; }
+  .why td, .why th { border: 1px solid #d8dce3; padding: 6px 12px; font-size: 13px; text-align: center; }
+  .why th { background: #f0f2f6; }
+</style>
+</head>
+<body>
+
+<h1>Shared-Memory Bank Conflicts &mdash; and the +1 Padding Fix</h1>
+<p class="subtitle">
+  Scaled-down model: <b>8 banks, 8 lanes per warp, tile[8][8] vs tile[8][9]</b>
+  (real hardware: 32 banks, 32 lanes, tile[32][32] vs tile[32][33] &mdash; identical math,
+  since 8&nbsp;%&nbsp;8&nbsp;=&nbsp;0 just like 32&nbsp;%&nbsp;32&nbsp;=&nbsp;0, and 9&nbsp;%&nbsp;8&nbsp;=&nbsp;1 just like 33&nbsp;%&nbsp;32&nbsp;=&nbsp;1).
+  Cell color = which bank that element lives in. Black-bordered cells = the 8 elements
+  one warp accesses in a single instruction. The columns below each tile are the
+  <b>bank queues</b>: chips stacked in the same queue must be served one per cycle &mdash; that's the conflict.
+</p>
+
+<div class="codebox" id="codeBox">
+  <span class="ln" data-acc="row">    tile[ty][tx] = A[row * cols + col];   // load: warp walks a ROW of the tile</span>
+  <span class="ln">    __syncthreads();</span>
+  <span class="ln" data-acc="col">    B[out_row * rows + out_col] = tile[tx][ty];   // transposed read: warp walks a COLUMN</span>
+</div>
+
+<div class="controls">
+  <label>Warp access:
+    <select id="patternSel">
+      <option value="col" selected>tile[tx][ty] — transposed read (the store phase)</option>
+      <option value="row">tile[ty][tx] — straight read/write (the load phase)</option>
+    </select>
+  </label>
+  <label>fixed <span id="fixedName">ty</span> = <input id="fixedSel" type="range" min="0" max="7" value="2" style="vertical-align:middle"> <b id="fixedVal">2</b></label>
+  <button id="btnStep" class="primary">Step cycle &#9654;</button>
+  <button id="btnPlay">Play &#9654;&#9654;</button>
+  <button id="btnReset">&#9198; Reset</button>
+</div>
+
+<div id="cycleLine"></div>
+
+<div class="panels">
+  <div class="panel" id="panelU">
+    <h2>__shared__ float tile[8][8]</h2>
+    <div class="verdict"></div>
+    <div class="tilegrid" style="grid-template-columns: repeat(8, 38px);"></div>
+    <div class="bankrow"></div>
+    <div class="formula"></div>
+  </div>
+  <div class="panel" id="panelP">
+    <h2>__shared__ float tile[8][9] &nbsp;&larr; +1 pad</h2>
+    <div class="verdict"></div>
+    <div class="tilegrid" style="grid-template-columns: repeat(9, 38px);"></div>
+    <div class="bankrow"></div>
+    <div class="formula"></div>
+  </div>
+</div>
+
+<div class="why">
+  <h2>Why the +1 works</h2>
+  <p>
+    Bank of an element = (its flat index) % (number of banks). Flat index of
+    <code>tile[i][j]</code> = <code>i * rowStride + j</code>, where <code>rowStride</code>
+    is the declared row width &mdash; <b>8</b> unpadded, <b>9</b> padded.
+  </p>
+  <p>
+    The transposed read walks a <i>column</i>: lane L reads <code>tile[L][ty]</code>,
+    flat index <code>L * rowStride + ty</code>. Between consecutive lanes the address
+    jumps by <code>rowStride</code>:
+  </p>
+  <table>
+    <tr><th></th><th>address stride between lanes</th><th>stride % banks</th><th>banks hit</th><th>transactions</th></tr>
+    <tr><td>tile[8][8]</td><td>8</td><td>0</td><td>all lanes &rarr; one bank</td><td><b>8 (serialized)</b></td></tr>
+    <tr><td>tile[8][9]</td><td>9</td><td>1</td><td>each lane &rarr; next bank over</td><td><b>1</b></td></tr>
+  </table>
+  <p>
+    A stride that shares a factor with the bank count keeps revisiting the same banks;
+    a stride <b>coprime</b> with the bank count visits every bank before repeating.
+    8 (or 32) <i>is</i> the bank count &mdash; worst case. 9 (or 33) is coprime &mdash; best case.
+    The pad column (hatched) is never read or written; it exists only to shift each row's
+    starting bank by one. Cost: one float per row. Payoff: the column walk goes from
+    8&times; (32&times; on real hardware) serialized to a single transaction.
+  </p>
+  <p style="color:#666">
+    Switch the access selector to the <i>load</i> pattern <code>tile[ty][tx]</code> and note
+    both tiles are conflict-free: a row walk has stride 1, which is always coprime with the
+    bank count. Conflicts come from <i>column</i> walks &mdash; exactly what a transpose must do somewhere.
+    The padding lets you keep the column walk in shared memory and make it free.
+  </p>
+</div>
+
+<script>
+const NB = 8;            // banks (real: 32)
+const LANES = 8;         // lanes per warp (real: 32)
+
+// pastel background + strong chip color per bank
+const bankBg = ["#ffd9d9","#ffe8c7","#fff3b0","#d6f5c9","#c9ecf5","#d4ddff","#ecd6ff","#ffd6ee"];
+const bankFg = ["#d64545","#d98a23","#bfa000","#4ca830","#2e9ab5","#4a63d8","#9b4ad8","#d8488f"];
+
+let pattern = "col";     // "col" = tile[tx][ty] (transposed read), "row" = tile[ty][tx]
+let fixedIdx = 2;
+let cycle = 0;
+let playing = false, timer = null;
+
+function accesses(rowStride) {
+  // returns per-lane {i, j, flat, bank}
+  const out = [];
+  for (let L = 0; L < LANES; L++) {
+    const i = (pattern === "col") ? L : fixedIdx;
+    const j = (pattern === "col") ? fixedIdx : L;
+    const flat = i * rowStride + j;
+    out.push({ lane: L, i, j, flat, bank: flat % NB });
+  }
+  return out;
+}
+
+function buildPanel(id, rowStride) {
+  const root = document.getElementById(id);
+  const grid = root.querySelector(".tilegrid");
+  grid.innerHTML = "";
+  const cells = [];
+  for (let i = 0; i < 8; i++) {
+    cells.push([]);
+    for (let j = 0; j < rowStride; j++) {
+      const d = document.createElement("div");
+      d.className = "cell";
+      const flat = i * rowStride + j;
+      if (j >= 8) {           // the pad column
+        d.classList.add("pad");
+        d.textContent = "pad";
+      } else {
+        d.style.background = bankBg[flat % NB];
+        d.textContent = "b" + (flat % NB);
+      }
+      grid.appendChild(d);
+      cells[i].push(d);
+    }
+  }
+  return { root, cells, rowStride };
+}
+
+const panels = [
+  buildPanel("panelU", 8),
+  buildPanel("panelP", 9),
+];
+
+function render() {
+  const fixedName = (pattern === "col") ? "ty" : "tx";
+  document.getElementById("fixedName").textContent = fixedName;
+  document.getElementById("fixedVal").textContent = fixedIdx;
+  document.querySelectorAll("#codeBox .ln").forEach(ln =>
+    ln.classList.toggle("active", ln.dataset.acc === pattern));
+
+  let maxCycles = 0;
+
+  for (const p of panels) {
+    const acc = accesses(p.rowStride);
+
+    // group lanes into bank queues (in lane order)
+    const queues = Array.from({ length: NB }, () => []);
+    acc.forEach(a => queues[a.bank].push(a));
+    const txNeeded = Math.max(...queues.map(q => q.length));
+    maxCycles = Math.max(maxCycles, txNeeded);
+
+    // tile cells
+    p.cells.forEach(row => row.forEach(d => {
+      d.classList.remove("hit", "served");
+      const old = d.querySelector(".lane");
+      if (old) old.remove();
+    }));
+    acc.forEach(a => {
+      const d = p.cells[a.i][a.j];
+      d.classList.add("hit");
+      const posInQueue = queues[a.bank].indexOf(a);
+      if (posInQueue < cycle) d.classList.add("served");
+      const badge = document.createElement("span");
+      badge.className = "lane";
+      badge.textContent = "L" + a.lane;
+      d.appendChild(badge);
+    });
+
+    // bank queues
+    const bankrow = p.root.querySelector(".bankrow");
+    bankrow.innerHTML = "";
+    queues.forEach((q, b) => {
+      const bank = document.createElement("div");
+      bank.className = "bank";
+      bank.innerHTML = `<div class="bname">bank ${b}</div>`;
+      const chips = document.createElement("div");
+      chips.className = "chips";
+      q.forEach((a, pos) => {
+        const c = document.createElement("div");
+        c.className = "chip" + (pos < cycle ? " served" : "");
+        c.style.background = bankFg[b];
+        c.textContent = "L" + a.lane;
+        chips.appendChild(c);
+      });
+      bank.appendChild(chips);
+      bankrow.appendChild(bank);
+    });
+
+    // verdict + formula
+    const banksHit = new Set(acc.map(a => a.bank)).size;
+    const v = p.root.querySelector(".verdict");
+    if (txNeeded === 1) {
+      p.root.className = "panel good";
+      v.textContent = `8 lanes → ${banksHit} banks → 1 transaction (conflict-free)`;
+    } else {
+      p.root.className = "panel bad";
+      v.textContent = `8 lanes → ${banksHit} bank${banksHit>1?"s":""} → ${txNeeded} transactions (${txNeeded}-way conflict)`;
+    }
+    const idxExpr = (pattern === "col")
+      ? `L*${p.rowStride} + ${fixedIdx}` : `${fixedIdx}*${p.rowStride} + L`;
+    p.root.querySelector(".formula").innerHTML =
+      `lane L reads tile[${pattern === "col" ? "L][" + fixedIdx : fixedIdx + "][L"}]` +
+      `<br>flat = ${idxExpr}` +
+      `<br>bank = flat % ${NB} &rarr; ` + acc.map(a => a.bank).join(", ");
+  }
+
+  // cycle narration
+  const line = document.getElementById("cycleLine");
+  if (cycle === 0) {
+    line.innerHTML = `<b>Cycle 0.</b> The warp issues one shared-memory instruction; all 8 lanes
+      request at once. Press <b>Step</b> to watch the banks serve them — each bank serves
+      <b>one</b> request per cycle.`;
+  } else {
+    const done = cycle >= maxCycles;
+    line.innerHTML = `<b>Cycle ${cycle}.</b> Each bank has served ${cycle} request${cycle>1?"s":""} so far. ` +
+      (done
+        ? `Both tiles are done — the unpadded tile needed <b>${panels[0].root.querySelector(".verdict").textContent.match(/\d+ transactions?|1 transaction/)[0]}</b>, the padded tile finished in cycle 1. That gap is the conflict cost.`
+        : `Faded chips are served; the unpadded tile still has lanes waiting in its single queue while the padded tile finished in cycle 1.`);
+  }
+  return maxCycles;
+}
+
+function step() {
+  const maxCycles = render();
+  if (cycle < maxCycles) { cycle++; render(); }
+  if (cycle >= maxCycles && playing) stop();
+}
+function stop() {
+  playing = false; clearInterval(timer);
+  document.getElementById("btnPlay").innerHTML = "Play &#9654;&#9654;";
+}
+document.getElementById("btnStep").onclick = () => { stop(); step(); };
+document.getElementById("btnPlay").onclick = () => {
+  if (playing) { stop(); return; }
+  if (cycle > 0) cycle = 0;
+  playing = true;
+  document.getElementById("btnPlay").textContent = "Pause";
+  timer = setInterval(step, 800);
+};
+document.getElementById("btnReset").onclick = () => { stop(); cycle = 0; render(); };
+document.getElementById("patternSel").onchange = e => { stop(); pattern = e.target.value; cycle = 0; render(); };
+document.getElementById("fixedSel").oninput = e => { stop(); fixedIdx = +e.target.value; cycle = 0; render(); };
+
+render();
+</script>
+</body>
+</html>
