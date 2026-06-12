@@ -22,6 +22,7 @@ add_library(cuda_kernels STATIC
     src/linalg/matmul_tiled.cu
     src/linalg/dotprod.cu
     src/linalg/transpose.cu
+    src/linalg/gemv.cu
 )
 target_include_directories(cuda_kernels PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
@@ -39,6 +40,7 @@ endfunction()
 add_kernel_test(test_matmul)
 add_kernel_test(test_dotprod)
 add_kernel_test(test_transpose)
+add_kernel_test(test_gemv)
 
 message(STATUS "CUDA Kernels Build Configuration:")
 message(STATUS "  CUDA compiler: ${CMAKE_CUDA_COMPILER}")

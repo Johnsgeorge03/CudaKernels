@@ -14,11 +14,16 @@ A collection of optimized CUDA kernel implementations for numerical operations, 
   - Naive (strided writes)
   - Shared-memory tiled (coalesced both ways, bank-conflicted)
   - Padded tile (`[TILE][TILE+1]`, conflict-free)
+- **GEMV** — matrix-vector multiply (`src/linalg/gemv.cu`)
+  - Naive (thread-per-row, uncoalesced)
+  - Warp-per-row (coalesced loads + warp-shuffle reduction)
+  - Warp-per-row with `x` staged in shared memory (a measured negative result — see Performance Notes)
 
 Interactive visualizations (download and open in a browser):
 
 - [docs/register_tiled_matmul_viz.html](docs/register_tiled_matmul_viz.html) — step-through of the register-tiled matmul kernel (cooperative tile loads, barriers, per-thread 2x2 accumulation)
 - [docs/bank_conflict_viz.html](docs/bank_conflict_viz.html) — shared-memory bank conflicts and why the +1 padding fixes them (animated bank queues, unpadded vs padded side by side)
+- [docs/memory_hierarchy_occupancy_viz.html](docs/memory_hierarchy_occupancy_viz.html) — the GPU memory hierarchy (DRAM / L2 / L1 / shared / registers) plus an interactive occupancy calculator; steps through why manually caching data that already fits in L2 makes a kernel slower
 
 ## Requirements
 
@@ -78,24 +83,28 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   └── linalg/
 │       ├── matmul.h
 │       ├── dotprod.h
-│       └── transpose.h
+│       ├── transpose.h
+│       └── gemv.h
 ├── src/
 │   └── linalg/
 │       ├── matmul_naive.cu
 │       ├── matmul_tiled.cu      # shared-memory tiled + register tiled
 │       ├── dotprod.cu
-│       └── transpose.cu         # naive + tiled + padded
+│       ├── transpose.cu         # naive + tiled + padded
+│       └── gemv.cu              # naive + warp-per-row + shared-x
 ├── tests/
 │   ├── test_utils.h             # shared correctness + benchmark helpers
 │   ├── test_matmul.cu
 │   ├── test_dotprod.cu
-│   └── test_transpose.cu
+│   ├── test_transpose.cu
+│   └── test_gemv.cu
 ├── scripts/
 │   └── plot_perf.py             # benchmark visualization (matplotlib)
 ├── docs/
 │   ├── perf.png                 # benchmark chart (generated)
 │   ├── register_tiled_matmul_viz.html   # interactive kernel walkthrough
-│   └── bank_conflict_viz.html           # bank conflicts + padding fix
+│   ├── bank_conflict_viz.html           # bank conflicts + padding fix
+│   └── memory_hierarchy_occupancy_viz.html  # memory hierarchy + occupancy calculator
 └── CMakeLists.txt
 ```
 
@@ -112,6 +121,12 @@ GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift 
 - **Transpose** (2048 x 4096): naive ~56 GB/s → tiled ~82 GB/s → padded ~139 GB/s (~72% of peak).
   - Tiled fixes global-write coalescing by staging the swap through shared memory; the gain is capped by a 32-way bank conflict on the transposed shared read.
   - Padding the tile to `[TILE][TILE+1]` removes the conflict (stride 33 is coprime with the 32 banks) and nearly doubles tiled throughput — the bank-conflict cost, isolated and measured.
+- **GEMV** (4096 x 4096): naive ~31–39 GB/s → warp-per-row ~151 GB/s (~79% of peak) → warp + shared-`x` ~120–130 GB/s.
+  - Thread-per-row makes a warp's 32 threads load addresses a full row apart (stride-N, uncoalesced: ~32 transactions where 1 would do). Warp-per-row flips the mapping — a warp owns one row and its 32 lanes read 32 consecutive floats per step, one coalesced transaction — then a warp-shuffle reduction collapses the partials. The ~31 → ~151 GB/s jump is the cost of coalescing, isolated and measured.
+  - Staging `x` in shared memory **regressed ~15–20%**, for two stacked reasons:
+    1. **L2 already had it.** `x` is 16 KB and re-read by all 4096 rows, so after the first touch it lives permanently in the 1.5 MB chip-wide L2 — the staging loop's global reads hit L2 anyway, saving zero DRAM traffic while adding 4096 loads + 4096 shared stores + a `__syncthreads()` to every block.
+    2. **Occupancy collapse.** The 16 KB/block dynamic shared allocation lets only ⌊96 KB / 16 KB⌋ = 6 blocks fit per SM, versus the 16 the thread budget (2048/128) allows: 24 resident warps instead of 64 (100% → 37.5% occupancy), so the SM has far fewer warps to switch to while `A`'s loads stall.
+  - Takeaway: shared memory is a *manually managed* scratchpad rented from the SM's 96 KB budget, not a free cache. Spend it only to save traffic the caches can't absorb (matmul tiles, convolution halos) — never to duplicate a small read-only vector that already fits in L2. See [docs/memory_hierarchy_occupancy_viz.html](docs/memory_hierarchy_occupancy_viz.html) for the interactive walkthrough.
 
 ## Troubleshooting
 

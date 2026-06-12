@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GPU Memory Hierarchy &amp; Occupancy — why caching x in shared memory lost</title>
+<style>
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 20px 28px 48px;
+    background: #f6f7fa; color: #222;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2.section { font-size: 17px; margin: 28px 0 8px; }
+  .subtitle { color: #555; margin: 0 0 16px; font-size: 14px; max-width: 980px; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 16px;
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px; font-size: 13.5px;
+  }
+  .controls button {
+    font-size: 15px; padding: 6px 14px; border-radius: 8px;
+    border: 1px solid #c8cdd6; background: #fff; cursor: pointer;
+  }
+  .controls button:hover { background: #eef1f6; }
+  .controls button.primary { background: #2b6fdb; color: #fff; border-color: #2b6fdb; }
+  .controls code { background: #f0f2f6; border-radius: 3px; padding: 1px 5px; }
+  #storyLine {
+    background: #fff; border-left: 4px solid #2b6fdb; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 14px; min-height: 38px;
+    max-width: 980px;
+  }
+  #storyLine b { color: #2b6fdb; }
+  .codebox {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px;
+    font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.6;
+  }
+  .codebox .cm { color: #888; }
+  .codebox .kw { color: #2b6fdb; }
+  .panels { display: flex; gap: 22px; flex-wrap: wrap; align-items: flex-start; }
+  .panel {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 14px 18px 18px; flex: 1; min-width: 440px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 10px; }
+
+  /* ---- hierarchy ---- */
+  .smbox {
+    border: 2px dashed #b8c0cc; border-radius: 10px;
+    padding: 8px 10px 10px; margin-bottom: 8px;
+  }
+  .smbox .smlabel { font-size: 11.5px; color: #778; font-weight: 700; margin-bottom: 6px; }
+  .level {
+    border-radius: 8px; padding: 7px 12px 9px; margin: 6px 0;
+    border: 1px solid;
+  }
+  .level .lname { font-weight: 700; font-size: 13px; }
+  .level .lstats { font-size: 11.5px; color: #445; font-family: Consolas, monospace; margin-top: 1px; }
+  .level .chips { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; align-items: center; min-height: 0; }
+  .lv-reg   { background: #e8f6ec; border-color: #b5dec2; width: 46%; }
+  .lv-shl1  { display: flex; gap: 8px; }
+  .lv-sh    { background: #e9f0fb; border-color: #bfd2ee; flex: 1.2; }
+  .lv-l1    { background: #eef italic; background: #eef2f8; border-color: #ccd6e6; flex: 1; }
+  .lv-l2    { background: #f3ecfa; border-color: #d8c5ec; width: 76%; }
+  .lv-dram  { background: #fbeeec; border-color: #eccac5; width: 100%; box-sizing: border-box; }
+  .xchip {
+    background: #f2a93b; color: #4a3100; font-family: Consolas, monospace;
+    font-size: 11px; font-weight: 700; border-radius: 5px; padding: 2px 8px;
+    animation: pop .35s ease;
+  }
+  .xchip.hitpulse { animation: pulse 1.1s ease infinite; }
+  .xchip.note { background: #fbe3b8; font-weight: 400; }
+  @keyframes pop   { from { transform: scale(.4); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(242,169,59,.7); } 50% { box-shadow: 0 0 0 7px rgba(242,169,59,0); } }
+  .arrowdown { text-align: center; color: #99a; font-size: 13px; margin: -2px 0; }
+
+  /* ---- counters ---- */
+  .counter {
+    display: flex; justify-content: space-between; gap: 12px;
+    border-bottom: 1px solid #eef0f4; padding: 7px 2px; font-size: 13px;
+  }
+  .counter:last-child { border-bottom: none; }
+  .counter .cval { font-family: Consolas, monospace; font-weight: 700; color: #667; }
+  .counter.lit { background: #fff7e8; border-radius: 6px; }
+  .counter.lit .cval { color: #b06d00; }
+  .counter.bad .cval { color: #c0392b; }
+  .counter.good .cval { color: #1e8449; }
+
+  /* ---- occupancy calculator ---- */
+  .calc { background: #fff; border: 1px solid #e1e4ea; border-radius: 10px; padding: 14px 18px 18px; }
+  .sliders { display: flex; flex-wrap: wrap; gap: 26px; margin: 6px 0 14px; font-size: 13.5px; }
+  .sliders label { display: flex; flex-direction: column; gap: 4px; min-width: 220px; }
+  .sliders input[type=range] { width: 220px; }
+  .sliders .val { font-family: Consolas, monospace; font-weight: 700; color: #2b6fdb; }
+  .presets { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .presets button {
+    font-size: 13px; padding: 5px 12px; border-radius: 7px;
+    border: 1px solid #c8cdd6; background: #fff; cursor: pointer;
+  }
+  .presets button:hover { background: #eef1f6; }
+  table.res { border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+  table.res th, table.res td { padding: 5px 14px; text-align: right; border-bottom: 1px solid #eef0f4; }
+  table.res th { color: #667; font-weight: 600; }
+  table.res td:first-child, table.res th:first-child { text-align: left; }
+  table.res td { font-family: Consolas, monospace; }
+  tr.limit td { background: #fdeceb; color: #c0392b; font-weight: 700; }
+  tr.limit td:first-child::after { content: "  ← binding limit"; font-size: 11px; }
+  .warpgrid { display: grid; grid-template-columns: repeat(16, 26px); gap: 4px; margin: 10px 0 6px; }
+  .wslot {
+    width: 26px; height: 22px; border-radius: 4px; background: #e6e9ef;
+    border: 1px solid #d5d9e2;
+  }
+  .wslot.on  { background: #3b7dd8; border-color: #2b6fdb; }
+  .wslot.on.alt { background: #7aa8e8; }
+  .occline { font-size: 14.5px; margin-top: 6px; }
+  .occline b { font-family: Consolas, monospace; }
+  .occgoodtxt { color: #1e8449; } .occbadtxt { color: #c0392b; }
+  .fineprint { font-size: 11.5px; color: #889; margin-top: 10px; max-width: 900px; }
+
+  /* ---- verdict ---- */
+  .verdictbox {
+    background: #fff; border: 1px solid #e1e4ea; border-left: 5px solid #1e8449;
+    border-radius: 10px; padding: 14px 18px; margin-top: 24px; max-width: 980px;
+    font-size: 14px; line-height: 1.55;
+  }
+  .verdictbox table { border-collapse: collapse; margin: 8px 0 10px; font-size: 13px; }
+  .verdictbox td, .verdictbox th { border: 1px solid #e1e4ea; padding: 4px 12px; font-family: Consolas, monospace; }
+  .verdictbox th { background: #f4f6f9; font-family: "Segoe UI", sans-serif; }
+</style>
+</head>
+<body>
+
+<h1>GPU Memory Hierarchy &amp; Occupancy</h1>
+<p class="subtitle">
+  Why <code>gemvWarpSharedXKernel</code> (manually caching <b>x</b> in shared memory) ran
+  <b>~20% slower</b> than the plain warp-per-row kernel — measured on a GTX 1060 Max-Q
+  (GP106, sm_61). Two stacked reasons: <b>L2 was already caching x for free</b>, and the
+  16&nbsp;KB/block shared allocation <b>crashed occupancy</b>. Step through the story, then
+  play with the occupancy calculator below.
+</p>
+
+<div class="codebox">
+<span class="cm">// The only difference between the two kernels (M = N = 4096, x = 16 KB):</span><br>
+<span class="cm">// plain:    sum += A[row*N + i] * x[i];           // x read from global → L2 catches it</span><br>
+<span class="cm">// shared-x: </span><span class="kw">extern __shared__</span> float xs[];  <span class="cm">// 16 KB carved out of every block's SM budget</span><br>
+<span class="cm">//           for (i = tx; i &lt; N; i += blockDim.x) xs[i] = x[i];   // staging copy, every block</span><br>
+<span class="cm">//           __syncthreads();</span><br>
+<span class="cm">//           sum += A[row*N + i] * xs[i];</span>
+</div>
+
+<div class="controls">
+  <button id="btnStep" class="primary">▶ Next step</button>
+  <button id="btnReset">⟲ Reset</button>
+  <span id="stepLabel">Step 0 / 3</span>
+</div>
+
+<div id="storyLine"><b>Start.</b> <span id="storyText">Like all data, <b>x</b> (4096 floats = 16 KB)
+begins in DRAM — 6 GB of GDDR5, ~500 cycles away from the cores. Press <b>Next step</b> to run the
+plain warp-per-row kernel and watch where x ends up living.</span></div>
+
+<div class="panels">
+  <div class="panel">
+    <h2>The memory hierarchy (GP106) — fast &amp; tiny on top, slow &amp; huge below</h2>
+
+    <div class="smbox">
+      <div class="smlabel">ON THE SM — per-SM resources, × 10 SMs on this chip</div>
+      <div class="level lv-reg">
+        <div class="lname">Registers</div>
+        <div class="lstats">256 KB/SM (65,536 × 32-bit) · ~0 cycles · private per thread</div>
+      </div>
+      <div class="lv-shl1">
+        <div class="level lv-sh">
+          <div class="lname">Shared memory</div>
+          <div class="lstats">96 KB/SM · ~30 cycles · <b>manual scratchpad — NOT a cache</b></div>
+          <div class="chips" id="chipsShared"></div>
+        </div>
+        <div class="level lv-l1">
+          <div class="lname">L1 / texture cache</div>
+          <div class="lstats">48 KB/SM · ~30 cycles · automatic</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrowdown">▲ on-chip, per SM &nbsp;·&nbsp; ▼ on-chip, shared by all SMs</div>
+
+    <div class="level lv-l2">
+      <div class="lname">L2 cache — chip-wide, every global load/store passes through it</div>
+      <div class="lstats">1.5 MB · ~200 cycles · automatic (hardware-managed)</div>
+      <div class="chips" id="chipsL2"></div>
+    </div>
+
+    <div class="arrowdown">▼ off-chip</div>
+
+    <div class="level lv-dram">
+      <div class="lname">DRAM (global memory)</div>
+      <div class="lstats">6 GB GDDR5 · ~400–600 cycles · 192 GB/s peak — the bottleneck</div>
+      <div class="chips" id="chipsDram"><span class="xchip">x · 16 KB</span>
+        <span class="xchip note">A · 256 MB (streamed once, no reuse)</span></div>
+    </div>
+
+    <div class="fineprint">
+      Each step down is roughly 10× slower and ~10× bigger. <b>Caches (L1, L2) are automatic</b> —
+      hardware decides what stays hot. <b>Shared memory is manual</b> — same speed as L1, but you
+      do the filling, you pay the barrier, and you rent the space from the SM's 96 KB budget.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>The bill — what each kernel actually pays</h2>
+    <div class="counter" id="cnt-xdram">
+      <span>DRAM traffic for <b>x</b> (both kernels)</span><span class="cval" id="v-xdram">—</span>
+    </div>
+    <div class="counter" id="cnt-xhits">
+      <span>Later re-reads of <b>x</b> (4095 more rows)</span><span class="cval" id="v-xhits">—</span>
+    </div>
+    <div class="counter" id="cnt-adram">
+      <span>DRAM traffic for <b>A</b> (both kernels)</span><span class="cval" id="v-adram">—</span>
+    </div>
+    <div class="counter" id="cnt-stage">
+      <span>Extra staging work (shared-x only)</span><span class="cval" id="v-stage">—</span>
+    </div>
+    <div class="counter" id="cnt-occ">
+      <span>Occupancy (see calculator below)</span><span class="cval" id="v-occ">—</span>
+    </div>
+    <div class="counter" id="cnt-meas">
+      <span>Measured throughput</span><span class="cval" id="v-meas">—</span>
+    </div>
+    <div class="fineprint">
+      The decisive line: the staging loop's global reads of x <b>hit L2 anyway</b>, so shared-x
+      saves <b>zero</b> DRAM traffic — it can only add costs. Shared memory pays off when it
+      saves traffic L2 <i>can't</i> absorb (matmul tiles, convolution halos), not for a 16 KB
+      vector sitting comfortably inside 1.5 MB of L2.
+    </div>
+  </div>
+</div>
+
+<h2 class="section">Occupancy calculator — how shared memory rents out your latency hiding</h2>
+<p class="subtitle">
+  An SM hides DRAM latency by keeping many blocks resident and switching between their warps:
+  while one warp waits ~500 cycles on a load, others run. <b>Resident blocks = the minimum over
+  every resource limit.</b> Drag the shared-memory slider and watch the warp slots — the SM's
+  latency-hiding pool — drain.
+</p>
+
+<div class="calc">
+  <div class="presets">
+    <button onclick="preset(128,0,32)">preset: gemv warp (plain) — 128 thr, 0 KB shared</button>
+    <button onclick="preset(128,16,32)">preset: gemv warp+smemX — 128 thr, 16 KB shared</button>
+  </div>
+  <div class="sliders">
+    <label>threads / block: <span class="val" id="lblThr">128</span>
+      <input type="range" id="slThr" min="32" max="1024" step="32" value="128"></label>
+    <label>shared memory / block: <span class="val" id="lblSh">0 KB</span>
+      <input type="range" id="slSh" min="0" max="48" step="1" value="0"></label>
+    <label>registers / thread: <span class="val" id="lblReg">32</span>
+      <input type="range" id="slReg" min="16" max="128" step="8" value="32"></label>
+  </div>
+
+  <table class="res" id="resTable">
+    <tr><th>SM resource (sm_61)</th><th>budget / SM</th><th>per block</th><th>→ max blocks</th></tr>
+    <tr id="r-thr"><td>Threads</td><td>2048</td><td id="n-thr"></td><td id="b-thr"></td></tr>
+    <tr id="r-sh"><td>Shared memory</td><td>96 KB</td><td id="n-sh"></td><td id="b-sh"></td></tr>
+    <tr id="r-reg"><td>Registers</td><td>65,536</td><td id="n-reg"></td><td id="b-reg"></td></tr>
+    <tr id="r-slot"><td>Block slots</td><td>32</td><td>1</td><td id="b-slot">32</td></tr>
+  </table>
+
+  <div>Warp slots on the SM (64 total) — filled = resident, alternating shades = different blocks:</div>
+  <div class="warpgrid" id="warpGrid"></div>
+  <div class="occline" id="occLine"></div>
+
+  <div class="fineprint">
+    Textbook model: allocation granularities ignored (real hardware rounds shared memory and
+    registers up to allocation units). sm_61 also caps a single <i>block</i> at 48 KB shared,
+    which is why the slider stops there even though the SM has 96 KB.
+  </div>
+</div>
+
+<div class="verdictbox">
+  <b>The verdict, with the measured numbers (M = N = 4096):</b>
+  <table>
+    <tr><th>kernel</th><th>mapping</th><th>GB/s</th><th>occupancy</th></tr>
+    <tr><td>gemv naive</td><td>thread-per-row, stride-N (uncoalesced)</td><td>~31</td><td>100%</td></tr>
+    <tr><td>gemv warp</td><td>warp-per-row, coalesced</td><td><b>~151</b></td><td>100%</td></tr>
+    <tr><td>gemv warp+smemX</td><td>warp-per-row + x staged in shared</td><td>~120</td><td>37.5%</td></tr>
+  </table>
+  Staging x in shared memory <b>re-implemented by hand what L2 was already doing for free</b>
+  (x = 16 KB ≪ 1.5 MB L2, re-read by all 4096 rows → permanent L2 resident after the first touch).
+  It saved no DRAM traffic, and it paid twice: <b>(1)</b> 4096 extra loads + 4096 shared stores +
+  a <code>__syncthreads()</code> in every one of the 1024 blocks, and <b>(2)</b> the 16 KB/block
+  allocation let only ⌊96/16⌋ = <b>6 blocks</b> fit per SM instead of the 16 the thread budget
+  allows — 24 resident warps instead of 64, so the SM had far fewer warps to switch to while
+  A's loads stalled. <b>Rule of thumb:</b> spend shared memory only to save traffic the caches
+  can't — heavy block-local reuse of data too big or too thrashed for L2 (matmul tiles,
+  convolution halos) — never to duplicate a small read-only vector that already fits in L2.
+</div>
+
+<script>
+// ----------------------------- story steps ------------------------------
+const $ = id => document.getElementById(id);
+let step = 0;
+
+const steps = [
+  { // step 1
+    label: "Step 1 / 3",
+    html: "<b>Plain kernel — the first warp touches x.</b> Those reads miss L2 and go all the " +
+          "way to DRAM (~500 cycles). On the way back, the 16 KB of x is <b>filled into L2 " +
+          "automatically</b>. This round trip happens exactly once.",
+    run() {
+      addChip("chipsL2", "x · 16 KB (filled on first miss)", "l2x");
+      setCounter("cnt-xdram", "v-xdram", "16 KB — once, ever", "lit");
+    }
+  },
+  { // step 2
+    label: "Step 2 / 3",
+    html: "<b>Rows 1…4095 re-read x.</b> Every one of those reads <b>hits L2</b> (~200 cycles, " +
+          "often L1 at ~30) — zero extra DRAM traffic. The hardware cached x for free. Meanwhile " +
+          "A streams its 256 MB from DRAM with no reuse — <b>that</b> is the traffic that " +
+          "saturates the 192 GB/s bus, and the warp kernel rides it at ~151 GB/s.",
+    run() {
+      const c = $("l2x"); if (c) c.classList.add("hitpulse");
+      setCounter("cnt-xhits", "v-xhits", "all L2/L1 hits · 0 B from DRAM", "good");
+      setCounter("cnt-adram", "v-adram", "256 MB — the real bottleneck", "lit");
+      setCounter("cnt-meas", "v-meas", "gemv warp: ~151 GB/s", "good");
+    }
+  },
+  { // step 3
+    label: "Step 3 / 3",
+    html: "<b>Shared-x kernel — every block stages x by hand.</b> Each of the 1024 blocks copies " +
+          "all 4096 floats into its own shared array and barriers. The copy's global reads " +
+          "<b>hit L2 anyway</b> — nothing saved — but now every block pays 4096 loads + 4096 " +
+          "stores + a <code>__syncthreads()</code>, and its 16 KB shared allocation means only " +
+          "6 blocks fit per SM instead of 16: occupancy 100% → 37.5%. Result: ~120 GB/s, a " +
+          "~20% loss. Scroll down and press the two presets to see the warp slots drain.",
+    run() {
+      addChip("chipsShared", "xs · 16 KB (block 0)");
+      addChip("chipsShared", "xs · 16 KB (block 1)");
+      addChip("chipsShared", "… one copy in every resident block", "", true);
+      setCounter("cnt-stage", "v-stage", "1024 × (4096 ld + 4096 st + barrier)", "bad");
+      setCounter("cnt-occ", "v-occ", "100% → 37.5% (24 of 64 warps)", "bad");
+      setCounter("cnt-meas", "v-meas", "warp ~151 → smemX ~120 GB/s", "bad");
+      preset(128, 16, 32);
+    }
+  }
+];
+
+function addChip(where, text, id, note) {
+  const s = document.createElement("span");
+  s.className = "xchip" + (note ? " note" : "");
+  if (id) s.id = id;
+  s.textContent = text;
+  $(where).appendChild(s);
+}
+function setCounter(rowId, valId, text, cls) {
+  $(valId).textContent = text;
+  $(rowId).className = "counter " + (cls || "");
+}
+
+$("btnStep").onclick = () => {
+  if (step >= steps.length) return;
+  const s = steps[step++];
+  $("stepLabel").textContent = s.label;
+  $("storyLine").innerHTML = s.html;
+  s.run();
+  if (step >= steps.length) $("btnStep").disabled = true;
+};
+$("btnReset").onclick = () => {
+  step = 0;
+  $("btnStep").disabled = false;
+  $("stepLabel").textContent = "Step 0 / 3";
+  $("storyLine").innerHTML = "<b>Start.</b> Like all data, <b>x</b> (4096 floats = 16 KB) begins " +
+    "in DRAM — 6 GB of GDDR5, ~500 cycles away from the cores. Press <b>Next step</b> to run the " +
+    "plain warp-per-row kernel and watch where x ends up living.";
+  $("chipsL2").innerHTML = "";
+  $("chipsShared").innerHTML = "";
+  ["cnt-xdram","cnt-xhits","cnt-adram","cnt-stage","cnt-occ","cnt-meas"].forEach(r => $(r).className = "counter");
+  ["v-xdram","v-xhits","v-adram","v-stage","v-occ","v-meas"].forEach(v => $(v).textContent = "—");
+  preset(128, 0, 32);
+};
+
+// ------------------------- occupancy calculator -------------------------
+const SM = { threads: 2048, warpsMax: 64, sharedKB: 96, regs: 65536, slots: 32 };
+
+function preset(t, s, r) {
+  $("slThr").value = t; $("slSh").value = s; $("slReg").value = r;
+  recalc();
+}
+
+function recalc() {
+  const t = +$("slThr").value, s = +$("slSh").value, r = +$("slReg").value;
+  $("lblThr").textContent = t;
+  $("lblSh").textContent = s + " KB";
+  $("lblReg").textContent = r;
+
+  const warpsPerBlock = t / 32;
+  const lim = {
+    "r-thr":  Math.floor(SM.threads / t),
+    "r-sh":   s === 0 ? Infinity : Math.floor(SM.sharedKB / s),
+    "r-reg":  Math.max(0, Math.floor(SM.regs / (r * t))),
+    "r-slot": SM.slots,
+  };
+
+  $("n-thr").textContent = t;
+  $("b-thr").textContent = lim["r-thr"];
+  $("n-sh").textContent  = s === 0 ? "0 KB" : s + " KB";
+  $("b-sh").textContent  = s === 0 ? "no limit" : lim["r-sh"];
+  $("n-reg").textContent = (r * t).toLocaleString();
+  $("b-reg").textContent = lim["r-reg"];
+
+  const blocks = Math.min(...Object.values(lim));
+  const warps  = Math.min(blocks * warpsPerBlock, SM.warpsMax);
+  const occ    = warps / SM.warpsMax;
+
+  // highlight every binding (minimal) resource row
+  for (const id of Object.keys(lim))
+    $(id).className = (lim[id] === blocks) ? "limit" : "";
+
+  // warp slot grid, shaded per block
+  const grid = $("warpGrid");
+  grid.innerHTML = "";
+  for (let w = 0; w < SM.warpsMax; w++) {
+    const d = document.createElement("div");
+    d.className = "wslot";
+    if (w < warps) {
+      d.classList.add("on");
+      if (Math.floor(w / warpsPerBlock) % 2 === 1) d.classList.add("alt");
+    }
+    grid.appendChild(d);
+  }
+
+  const pct = (occ * 100).toFixed(1).replace(/\.0$/, "");
+  $("occLine").innerHTML =
+    `<b>${blocks}</b> resident block${blocks === 1 ? "" : "s"} × ${warpsPerBlock} warp${warpsPerBlock === 1 ? "" : "s"} ` +
+    `= <b>${warps} / 64</b> warps resident → ` +
+    `<span class="${occ >= 0.99 ? "occgoodtxt" : occ >= 0.5 ? "" : "occbadtxt"}"><b>${pct}%</b> occupancy</span>` +
+    (occ < 0.5 ? " — thin latency-hiding pool: when a warp stalls on DRAM, the SM often has nothing to switch to." : "");
+}
+
+["slThr", "slSh", "slReg"].forEach(id => $(id).addEventListener("input", recalc));
+recalc();
+</script>
+</body>
+</html>
