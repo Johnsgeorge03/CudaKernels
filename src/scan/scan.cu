@@ -31,11 +31,19 @@ int scanNumBlocks(int N) {
 __global__ void scanHillisSteeleKernel(const float* in, float* out, int N) {
     __shared__ float s[SCAN_BLOCK];
     int tid = threadIdx.x;
+    if(tid < N)
+        s[tid] = in[tid];
+    __syncthreads();
 
-    // TODO (you): load in[tid] -> s[tid] (guard tid < N), then run the
-    // doubling loop with the two-phase (read register, sync, write, sync)
-    // update, and finally store s[tid] -> out[tid].
-    (void)s; (void)tid; (void)in; (void)out; (void)N;
+    float temp = 0;
+    for(int d = 1; d < N; d *= 2){
+        temp = tid - d >= 0 ? s[tid] + s[tid - d] : s[tid];
+        __syncthreads();
+        s[tid] = temp;
+        __syncthreads();
+    }
+    if( tid < N)
+        out[tid] = s[tid];
 }
 
 // ============================================================================
