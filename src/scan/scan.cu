@@ -73,15 +73,29 @@ __global__ void scanBlellochKernel(const float* in, float* out, int N) {
 // You can reuse the Hillis-Steele logic here; just index off a per-block base
 // and emit the block total. Guard the tail block where base+tid >= N.
 __global__ void scanBlockInclusiveKernel(const float* in, float* out,
-                                         float* blockSums, int N) {
+                                         float* blockSums, int N) 
+{
     __shared__ float s[ELEMENTS_PER_BLOCK];
     int tid  = threadIdx.x;
     int base = blockIdx.x * ELEMENTS_PER_BLOCK;
 
-    // TODO (you): load in[base+tid] -> s[tid] (0 if out of range), inclusive
-    // scan s[], store s[tid] -> out[base+tid] for in-range elements, and have
-    // one thread write the chunk total -> blockSums[blockIdx.x].
-    (void)s; (void)tid; (void)base; (void)in; (void)out; (void)blockSums; (void)N;
+    if( base + tid < N)
+        s[tid] = in[base + tid];
+    else
+        s[tid] = 0.0f; // partial block padding
+    __syncthreads();
+
+    float temp = 0.0f;
+    for( int d = 1; d < ELEMENTS_PER_BLOCK; d *= 2){
+        temp = ( tid - d >= 0 ) ? s[tid] + s[tid - d] : s[tid];
+        __syncthreads();
+        s[tid] = temp;
+        __syncthreads();
+    }
+    if( base + tid < N )
+        out[base + tid] = s[tid];
+
+    if( tid == 0 ) blockSums[blockIdx.x] = s[ELEMENTS_PER_BLOCK - 1];
 }
 
 // Pass 2: EXCLUSIVE-scan blockSums in place, so blockSums[b] becomes the sum of
