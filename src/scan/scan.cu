@@ -79,10 +79,7 @@ __global__ void scanBlockInclusiveKernel(const float* in, float* out,
     int tid  = threadIdx.x;
     int base = blockIdx.x * ELEMENTS_PER_BLOCK;
 
-    if( base + tid < N)
-        s[tid] = in[base + tid];
-    else
-        s[tid] = 0.0f; // partial block padding
+    s[tid] = ( base + tid < N ) ? in[base + tid] : 0.0f; // partial block padding
     __syncthreads();
 
     float temp = 0.0f;
@@ -105,18 +102,29 @@ __global__ void scanBlockSumsKernel(float* blockSums, int numBlocks) {
     __shared__ float s[SCAN_BLOCK];
     int tid = threadIdx.x;
 
-    // TODO (you): load blockSums[tid] (0 past numBlocks), exclusive-scan in
-    // shared memory, write back blockSums[tid] for tid < numBlocks.
-    (void)s; (void)tid; (void)blockSums; (void)numBlocks;
+    s[tid] = ( tid < numBlocks ) ? blockSums[tid] : 0.0f;
+    __syncthreads();
+
+    float temp = 0.0f;
+    for( int d = 1; d < ELEMENTS_PER_BLOCK; d *= 2 )
+    {
+        temp = (tid - d >= 0 )? s[tid] + s[tid - d] : s[tid];
+        __syncthreads();
+        s[tid] = temp;
+        __syncthreads();
+    }
+
+    if ( tid < numBlocks )
+        blockSums[tid] = ( tid == 0 ) ? 0.0f : s[tid - 1];
+
 }
 
 // Pass 3: broadcast each block's offset back onto its chunk: out[i] += offset.
 // Block 0 adds 0, so this is a no-op for it but harmless to run.
 __global__ void addBlockOffsetsKernel(float* out, const float* blockSums, int N) {
     int idx = blockIdx.x * ELEMENTS_PER_BLOCK + threadIdx.x;
-
-    // TODO (you): if idx < N, out[idx] += blockSums[blockIdx.x].
-    (void)idx; (void)out; (void)blockSums; (void)N;
+    if ( idx < N )
+        out[idx] += blockSums[blockIdx.x];
 }
 
 // ============================================================================
