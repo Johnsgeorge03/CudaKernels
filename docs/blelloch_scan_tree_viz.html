@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Blelloch Work-Efficient Scan — The Implicit Tree</title>
+<style>
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 20px 28px 48px;
+    background: #f6f7fa; color: #222;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #555; margin: 0 0 16px; font-size: 14px; max-width: 980px; line-height: 1.5; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px; font-size: 13.5px;
+  }
+  .controls button {
+    font-size: 15px; padding: 6px 14px; border-radius: 8px;
+    border: 1px solid #c8cdd6; background: #fff; cursor: pointer;
+  }
+  .controls button:hover { background: #eef1f6; }
+  .controls button.primary { background: #2b6fdb; color: #fff; border-color: #2b6fdb; }
+  .controls .phasechip {
+    margin-left: auto; font-family: Consolas, monospace; font-size: 13px;
+    padding: 4px 10px; border-radius: 20px; background: #eef1f6; color: #333;
+  }
+  .controls .phasechip.up   { background: #d6e6ff; color: #1b4f9b; }
+  .controls .phasechip.clear{ background: #ffe7c2; color: #9a5b00; }
+  .controls .phasechip.down { background: #d6f3df; color: #1e7a3d; }
+  #narration {
+    background: #fff; border-left: 4px solid #2b6fdb; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 14px; font-size: 14px; min-height: 22px; line-height: 1.5;
+  }
+  #narration b { color: #2b6fdb; }
+  #narration code { background: #f0f2f6; border-radius: 3px; padding: 1px 5px; font-size: 13px; }
+  .codebox {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px;
+    font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.65;
+  }
+  .codebox .ln { display: block; padding: 0 8px; border-radius: 4px; white-space: pre; color: #333; }
+  .codebox .ln.active { background: #fff3bf; outline: 1px solid #e6c200; }
+  .codebox .cmt { color: #8a93a3; }
+  .stage {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 8px; margin-bottom: 16px; overflow-x: auto;
+  }
+  svg { display: block; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: #555; margin: 2px 4px 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 14px; border-radius: 4px; border: 1px solid #bbb; display: inline-block; }
+  .why {
+    background: #fff; border: 1px solid #e1e4ea;
+    border-radius: 10px; padding: 16px 22px; max-width: 1000px;
+    font-size: 14px; line-height: 1.65;
+  }
+  .why h2 { font-size: 17px; margin-top: 0; }
+  .why h3 { font-size: 14.5px; margin: 18px 0 4px; }
+  .why code { background: #f0f2f6; border-radius: 3px; padding: 0 4px; font-size: 13px; }
+  .why table { border-collapse: collapse; margin: 10px 0; }
+  .why td, .why th { border: 1px solid #d8dce3; padding: 5px 11px; font-size: 13px; text-align: center; }
+  .why th { background: #f0f2f6; }
+</style>
+</head>
+<body>
+
+<h1>Blelloch Work-Efficient Scan &mdash; The Implicit Tree</h1>
+<p class="subtitle">
+  Scaled-down model: <b>n = 8 elements</b> (the real kernel does 1024 per block, two elements per thread).
+  The array along the bottom is the live <code>__shared__</code> memory <code>s[]</code>; everything above it is the
+  <b>implicit binary tree</b> the algorithm walks &mdash; <i>not stored separately</i>, just an overlay on the same 8 slots.
+  Notice every internal node sits directly above the <b>rightmost</b> index of the range it covers: that is where its sum
+  physically lives, overwriting the leaf that was there.
+</p>
+
+<div class="codebox" id="codeBox">
+  <span class="ln" data-phase="up">  <span class="cmt">// Up-sweep (reduce): build partial sums up the tree</span></span>
+  <span class="ln" data-phase="up">  for (d = n>>1; d > 0; d >>= 1)   if (tid &lt; d)  s[bi] += s[ai];</span>
+  <span class="ln" data-phase="clear">  s[n-1] = 0;                      <span class="cmt">// clear the root → seeds the exclusive scan</span></span>
+  <span class="ln" data-phase="down">  <span class="cmt">// Down-sweep: push prefixes back down the tree</span></span>
+  <span class="ln" data-phase="down">  for (d = 1; d &lt; n; d &lt;&lt;= 1)      if (tid &lt; d) { t=s[ai]; s[ai]=s[bi]; s[bi]+=t; }</span>
+  <span class="ln" data-phase="up clear down">  <span class="cmt">// ai = offset*(2*tid+1)-1  (left child) ,  bi = offset*(2*tid+2)-1  (right child)</span></span>
+</div>
+
+<div class="controls">
+  <button id="btnReset">&#9198; Reset</button>
+  <button id="btnBack">&#9664; Back</button>
+  <button id="btnStep" class="primary">Step &#9654;</button>
+  <button id="btnPlay">Play &#9654;&#9654;</button>
+  <span class="phasechip" id="phaseChip">ready</span>
+</div>
+
+<div id="narration"></div>
+
+<div class="stage">
+  <svg id="svg" width="820" height="470"></svg>
+  <div class="legend">
+    <span><i class="swatch" style="background:#cfe0ff;border-color:#7aa0e0"></i> left child (read, <code>ai</code>)</span>
+    <span><i class="swatch" style="background:#ffd9ad;border-color:#e09a4a"></i> right child / node written (<code>bi</code>)</span>
+    <span><i class="swatch" style="background:#e7ebf2;border-color:#c2c9d6"></i> not yet built</span>
+    <span><i class="swatch" style="background:#fff;border-color:#cfd5df"></i> built (holds its range's sum)</span>
+    <span><i class="swatch" style="background:#eef0f4;border-color:#d6dbe4"></i> consumed by down-sweep</span>
+  </div>
+</div>
+
+<div class="why">
+  <h2>How the tree is involved &mdash; in detail</h2>
+
+  <p>
+    There is no separate tree in memory. The 8-slot array <i>is</i> the tree, the way a segment tree or a heap is an
+    array: a <b>complete binary reduction tree</b> laid over the indices. Two facts define the layout:
+  </p>
+  <ul>
+    <li><b>Leaves = the input elements in natural left-to-right order</b> (slots 0&hellip;7).</li>
+    <li><b>Each internal node lives at the index of the <i>rightmost</i> leaf in its range.</b> That is the entire meaning
+        of the <code>-1</code> in <code>bi = offset*(2*tid+2)-1</code>: it always lands on the right child, so sums pile up rightward.</li>
+  </ul>
+
+  <h3>Up-sweep builds the tree (and overwrites in place)</h3>
+  <p>
+    Each level halves the number of active nodes and writes each parent's sum onto its right child's slot. Watch slot&nbsp;7:
+    it is reused at every level, because <i>many ranges share the same rightmost index</i>. That stacking &mdash; one node sitting
+    on top of another at the same column &mdash; is the in-place overwrite, and it is why the layout is <b>not</b> a pre/in/post-order
+    serialization (those need a distinct slot per node).
+  </p>
+  <table>
+    <tr><th>slot 7 after&hellip;</th><th>holds the sum of range</th></tr>
+    <tr><td>load</td><td>[7]&nbsp;&nbsp;(just the leaf)</td></tr>
+    <tr><td>level 1 (offset 1)</td><td>[6&ndash;7]</td></tr>
+    <tr><td>level 2 (offset 2)</td><td>[4&ndash;7]</td></tr>
+    <tr><td>level 3 (offset 4)</td><td>[0&ndash;7] &nbsp;= grand total</td></tr>
+  </table>
+  <p>
+    So after the up-sweep the <b>root (whole-array total) sits at the last slot</b>, <code>s[n-1]</code>. That is why the
+    down-sweep seeds itself by clearing exactly that slot.
+  </p>
+
+  <h3>Down-sweep drains the tree</h3>
+  <p>
+    Set the root to 0, then walk back down. At every node a thread does the swap-and-add
+    <code>t = s[ai]; s[ai] = s[bi]; s[bi] += t;</code>. Read it as: <i>the left child takes the parent's incoming
+    prefix; the right child takes that same prefix plus the left child's old subtree sum.</i> Those subtree sums are
+    exactly the values the up-sweep parked in the tree, which is why both sweeps use the identical
+    <code>ai</code>/<code>bi</code> addressing &mdash; the down-sweep is just reading back what the up-sweep stored. When you reach
+    the leaves, each slot holds the sum of everything strictly to its left: the exclusive scan.
+  </p>
+
+  <h3>Why bother — the work argument</h3>
+  <p>
+    The tree is what buys <b>work efficiency</b>. Up-sweep does <code>n-1</code> adds, down-sweep does <code>n-1</code> adds and swaps:
+    <b>O(n)</b> total, versus Hillis&ndash;Steele's <b>O(n&nbsp;log&nbsp;n)</b>. Depth is <code>2&middot;log&sub2;n</code> either way. The catch, and the
+    thing to measure on the GTX&nbsp;1060: the <code>2^d</code> strides make consecutive threads hit the same shared-memory
+    <b>bank</b>, so the theoretical work win can be eaten by bank conflicts (see <code>bank_conflict_viz.html</code>) unless you
+    pad the indices.
+  </p>
+</div>
+
+<script>
+// ---- model -----------------------------------------------------------------
+const N = 8;
+const INPUT = [3, 1, 7, 0, 4, 1, 6, 3];
+const numUp = Math.log2(N) | 0;
+
+// tree nodes: a node is stored at index `idx` on level L if (idx+1) % 2^L == 0.
+// its range is [idx - 2^L + 1 .. idx].
+const nodes = [];          // {L, idx, l, r, sum, x, y, key}
+const nodeMap = new Map();
+function spanSum(l, r) { let s = 0; for (let i = l; i <= r; i++) s += INPUT[i]; return s; }
+for (let L = 0; L <= numUp; L++) {
+  const stride = 1 << L;
+  for (let idx = stride - 1; idx < N; idx += stride) {
+    const node = { L, idx, l: idx - stride + 1, r: idx, sum: 0, key: L + "_" + idx };
+    node.sum = spanSum(node.l, node.r);
+    nodes.push(node);
+    nodeMap.set(node.key, node);
+  }
+}
+
+// ---- layout ----------------------------------------------------------------
+const MARGIN = 42, COLW = 92, ROWH = 96, TOPPAD = 34, LEAF_W = 60, LEAF_H = 46, RNODE = 24;
+function colX(idx) { return MARGIN + idx * COLW + COLW / 2; }
+function levelY(L) { return TOPPAD + (numUp - L) * ROWH; }
+for (const nd of nodes) { nd.x = colX(nd.idx); nd.y = levelY(nd.L); }
+
+// ---- steps -----------------------------------------------------------------
+// each step: {phase:'up'|'clear'|'down'|'done', level, offset, d, ops:[{ai,bi,tid}]}
+const steps = [];
+let offset = 1;
+for (let d = N >> 1; d > 0; d >>= 1) {
+  const ops = [];
+  for (let tid = 0; tid < d; tid++) ops.push({ tid, ai: offset * (2 * tid + 1) - 1, bi: offset * (2 * tid + 2) - 1 });
+  steps.push({ phase: "up", level: Math.log2(offset) + 1, offset, d, ops });
+  offset <<= 1;
+}
+steps.push({ phase: "clear", idx: N - 1 });
+for (let d = 1; d < N; d <<= 1) {
+  offset >>= 1;
+  const ops = [];
+  for (let tid = 0; tid < d; tid++) ops.push({ tid, ai: offset * (2 * tid + 1) - 1, bi: offset * (2 * tid + 2) - 1 });
+  steps.push({ phase: "down", level: Math.log2(offset) + 1, offset, d, ops });
+}
+steps.push({ phase: "done" });
+
+const upStepOfLevel   = L => L - 1;                  // step index that builds level L
+const downStepOfLevel = L => (2 * numUp + 1) - L;    // step index that consumes level L
+
+// ---- state -----------------------------------------------------------------
+let pos = 0;                 // number of steps completed; steps[pos] is the active (next) step
+let playing = false, timer = null;
+
+function replay(p) {
+  const s = INPUT.slice();
+  for (let i = 0; i < p; i++) {
+    const st = steps[i];
+    if (st.phase === "up")    for (const o of st.ops) s[o.bi] += s[o.ai];
+    else if (st.phase === "clear") s[st.idx] = 0;
+    else if (st.phase === "down") for (const o of st.ops) { const t = s[o.ai]; s[o.ai] = s[o.bi]; s[o.bi] += t; }
+  }
+  return s;
+}
+
+// ---- svg helpers -----------------------------------------------------------
+const SVGNS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("svg");
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+// static layers built once
+const edgeLayer = el("g", {}, svg);
+const arrowLayer = el("g", {}, svg);
+const nodeLayer = el("g", {}, svg);
+
+// arrowhead marker
+const defs = el("defs", {}, svg);
+const mk = el("marker", { id: "arrow", viewBox: "0 0 10 10", refX: "8", refY: "5",
+  markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" }, defs);
+el("path", { d: "M0,0 L10,5 L0,10 z", fill: "#b33" }, mk);
+
+// edges: each internal node connects down to its two children
+for (const nd of nodes) {
+  if (nd.L === 0) continue;
+  const childStride = 1 << (nd.L - 1);
+  const leftKey = (nd.L - 1) + "_" + (nd.idx - childStride);
+  const rightKey = (nd.L - 1) + "_" + nd.idx;
+  for (const k of [leftKey, rightKey]) {
+    const c = nodeMap.get(k);
+    if (c) el("line", { x1: nd.x, y1: nd.y, x2: c.x, y2: c.y, stroke: "#d7dce4", "stroke-width": "2", "data-edge": nd.key + "->" + k }, edgeLayer);
+  }
+}
+
+// node shapes
+const nodeEls = new Map();
+for (const nd of nodes) {
+  const g = el("g", {}, nodeLayer);
+  let shape;
+  if (nd.L === 0) {
+    shape = el("rect", { x: nd.x - LEAF_W / 2, y: nd.y - LEAF_H / 2, width: LEAF_W, height: LEAF_H, rx: 7 }, g);
+    el("text", { x: nd.x, y: nd.y + LEAF_H / 2 + 14, "text-anchor": "middle", "font-size": "11",
+      fill: "#8a93a3", "font-family": "Consolas, monospace" }, g).textContent = "s[" + nd.idx + "]";
+  } else {
+    shape = el("circle", { cx: nd.x, cy: nd.y, r: RNODE }, g);
+    el("text", { x: nd.x, y: nd.y - RNODE - 5, "text-anchor": "middle", "font-size": "10.5",
+      fill: "#97a0ae", "font-family": "Consolas, monospace" }, g).textContent = "[" + nd.l + ".." + nd.r + "]";
+  }
+  shape.setAttribute("stroke-width", "2");
+  const val = el("text", { x: nd.x, y: nd.y + 4, "text-anchor": "middle", "font-size": "14",
+    "font-weight": "700", "font-family": "Consolas, monospace" }, g);
+  nodeEls.set(nd.key, { g, shape, val });
+}
+
+// ---- render ----------------------------------------------------------------
+function render() {
+  const s = replay(pos);
+  const active = steps[pos];
+  const inDown = pos > numUp;          // past the clear step
+
+  // phase chip + code highlight
+  const chip = document.getElementById("phaseChip");
+  const phase = active ? active.phase : "done";
+  chip.className = "phasechip " + (phase === "up" ? "up" : phase === "clear" ? "clear" : phase === "down" ? "down" : "");
+  chip.textContent = phase === "up" ? "UP-SWEEP" : phase === "clear" ? "CLEAR ROOT" : phase === "down" ? "DOWN-SWEEP" : "DONE";
+  document.querySelectorAll("#codeBox .ln").forEach(ln =>
+    ln.classList.toggle("active", active && ln.dataset.phase && ln.dataset.phase.includes(phase)));
+
+  // active index sets
+  const reads = new Set(), writes = new Set();
+  if (active && active.ops) active.ops.forEach(o => { reads.add(o.ai); writes.add(o.bi); });
+  const clearIdx = active && active.phase === "clear" ? active.idx : -1;
+
+  // nodes
+  for (const nd of nodes) {
+    const { shape, val } = nodeEls.get(nd.key);
+    let fill = "#ffffff", stroke = "#cfd5df", textColor = "#333", showVal = true, valText = "";
+
+    if (nd.L === 0) {
+      // leaf row always shows live memory
+      valText = String(s[nd.idx]);
+      const built = true;
+      if (writes.has(nd.idx))      { fill = "#ffd9ad"; stroke = "#e09a4a"; }
+      else if (reads.has(nd.idx))  { fill = "#cfe0ff"; stroke = "#7aa0e0"; }
+      else if (nd.idx === clearIdx){ fill = "#ffe7c2"; stroke = "#e0a44a"; }
+      else                         { fill = "#ffffff"; stroke = "#cfd5df"; }
+    } else {
+      const built = pos > upStepOfLevel(nd.L);
+      const consumed = pos > downStepOfLevel(nd.L);
+      if (!built) { fill = "#e7ebf2"; stroke = "#c2c9d6"; textColor = "#aab"; showVal = false; }
+      else if (consumed) { fill = "#eef0f4"; stroke = "#d6dbe4"; textColor = "#aab"; showVal = false; }
+      else {
+        // built and live
+        valText = String(nd.sum);
+        showVal = !inDown;          // during down-sweep the memory no longer equals span sums
+        textColor = inDown ? "#aab" : "#333";
+        fill = inDown ? "#f6f8fb" : "#ffffff";
+        stroke = "#cfd5df";
+      }
+      // active highlight (overrides)
+      if (active && active.level === nd.L) {
+        if (writes.has(nd.idx) && active.phase === "up") { fill = "#ffd9ad"; stroke = "#e09a4a"; textColor = "#333"; }
+        if (active.phase === "down" && writes.has(nd.idx)) { fill = "#ffe7c2"; stroke = "#e0a44a"; }
+      }
+      if (active && active.phase === "up" && active.level === nd.L + 1 && reads.has(nd.idx)) {
+        fill = "#cfe0ff"; stroke = "#7aa0e0"; textColor = "#333"; showVal = true; valText = String(nd.sum);
+      }
+      if (clearIdx === nd.idx && nd.L === numUp) { fill = "#ffe7c2"; stroke = "#e0a44a"; }
+    }
+    shape.setAttribute("fill", fill);
+    shape.setAttribute("stroke", stroke);
+    val.setAttribute("fill", textColor);
+    val.textContent = showVal ? valText : "";
+  }
+
+  // arrows for the active step
+  arrowLayer.innerHTML = "";
+  if (active && active.ops) {
+    for (const o of active.ops) {
+      if (active.phase === "up") {
+        // left child (ai, level L-1) --> node (bi, level L)
+        const from = nodeMap.get((active.level - 1) + "_" + o.ai);
+        const to = nodeMap.get(active.level + "_" + o.bi);
+        if (from && to) drawArrow(from, to);
+      } else if (active.phase === "down") {
+        // node (bi, level L) --> both children (level L-1)
+        const parent = nodeMap.get(active.level + "_" + o.bi);
+        const lc = nodeMap.get((active.level - 1) + "_" + o.ai);
+        const rc = nodeMap.get((active.level - 1) + "_" + o.bi);
+        if (parent && lc) drawArrow(parent, lc);
+        if (parent && rc) drawArrow(parent, rc);
+      }
+    }
+  }
+
+  narrate(s, active);
+}
+
+function drawArrow(from, to) {
+  // shorten endpoints to node edges
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len;
+  const r1 = from.L === 0 ? LEAF_H / 2 + 2 : RNODE + 3;
+  const r2 = to.L === 0 ? LEAF_H / 2 + 6 : RNODE + 7;
+  el("line", {
+    x1: from.x + ux * r1, y1: from.y + uy * r1,
+    x2: to.x - ux * r2, y2: to.y - uy * r2,
+    stroke: "#b33", "stroke-width": "2.5", "marker-end": "url(#arrow)"
+  }, arrowLayer);
+}
+
+function narrate(s, active) {
+  const n = document.getElementById("narration");
+  if (!active || active.phase === "done") {
+    n.innerHTML = `<b>Done.</b> The bottom row is the <b>exclusive scan</b>: each <code>s[i]</code> holds the sum of every
+      element strictly to its left. Array now reads [${s.join(", ")}]. Press <b>Reset</b> to replay.`;
+    return;
+  }
+  if (active.phase === "clear") {
+    n.innerHTML = `<b>Clear the root.</b> After the up-sweep, <code>s[${active.idx}]</code> held the grand total
+      (${INPUT.reduce((a, b) => a + b, 0)}). Set it to <code>0</code> &mdash; this seed is what turns the down-sweep into an
+      <i>exclusive</i> scan (slot 0 must end at 0). Array: [${s.join(", ")}].`;
+    return;
+  }
+  const opTxt = active.ops.map(o => `t${o.tid}: ai=${o.ai}, bi=${o.bi}`).join(" &nbsp;|&nbsp; ");
+  if (active.phase === "up") {
+    n.innerHTML = `<b>Up-sweep, offset = ${active.offset}.</b> ${active.d} active thread${active.d > 1 ? "s" : ""}
+      (<code>tid &lt; ${active.d}</code>) each merge a pair into the <span style="color:#c47a17">right child</span>:
+      <code>s[bi] += s[ai]</code>. &nbsp;${opTxt}. <br>Each orange node now holds the sum of range
+      <code>[l..r]</code> shown above it &mdash; the partial sum lives at the range's rightmost slot. Array: [${s.join(", ")}].`;
+  } else {
+    n.innerHTML = `<b>Down-sweep, offset = ${active.offset}.</b> ${active.d} active thread${active.d > 1 ? "s" : ""}
+      do the swap-and-add: <code>t=s[ai]; s[ai]=s[bi]; s[bi]+=t</code>. The parent hands its prefix to the
+      <span style="color:#1b69c4">left child</span> and (prefix + left's old subtree sum) to the right.
+      &nbsp;${opTxt}. Array: [${s.join(", ")}].`;
+  }
+}
+
+// ---- controls --------------------------------------------------------------
+function stop() { playing = false; clearInterval(timer); document.getElementById("btnPlay").innerHTML = "Play &#9654;&#9654;"; }
+function stepFwd() { if (pos < steps.length - 1) { pos++; render(); } else stop(); }
+document.getElementById("btnStep").onclick = () => { stop(); stepFwd(); };
+document.getElementById("btnBack").onclick = () => { stop(); if (pos > 0) { pos--; render(); } };
+document.getElementById("btnReset").onclick = () => { stop(); pos = 0; render(); };
+document.getElementById("btnPlay").onclick = () => {
+  if (playing) { stop(); return; }
+  if (pos >= steps.length - 1) pos = 0;
+  playing = true;
+  document.getElementById("btnPlay").textContent = "Pause";
+  timer = setInterval(() => { stepFwd(); if (pos >= steps.length - 1) stop(); }, 1100);
+};
+
+render();
+</script>
+</body>
+</html>

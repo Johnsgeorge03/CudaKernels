@@ -58,11 +58,43 @@ __global__ void scanHillisSteeleKernel(const float* in, float* out, int N) {
 __global__ void scanBlellochKernel(const float* in, float* out, int N) {
     __shared__ float s[BLELLOCH_CAP];
     int tid = threadIdx.x;
+    int n = BLELLOCH_CAP;
 
-    // TODO (you): cooperatively load two elements per thread into s[] (guard
-    // against N < BLELLOCH_CAP by zero-filling the tail), run the up-sweep,
-    // zero the last slot, run the down-sweep, then write s[] back to out[].
-    (void)s; (void)tid; (void)in; (void)out; (void)N;
+    // Load elements with zero padding
+    s[2*tid] = (2*tid < N ) ? in[2*tid] : 0.0f;
+    s[2*tid + 1] = ( 2*tid + 1 < N) ? in[2*tid + 1] : 0.0f;
+
+    // Reduce
+    int offset = 1;
+    for( int d = n >> 1; d > 0; d >>= 1){
+        __syncthreads();
+        if( tid < d){
+            int l = offset*(2*tid + 1) - 1;
+            int r = offset*(2*tid + 2) - 1;
+            s[r] += s[l];
+        }
+        offset <<= 1;
+    }
+
+    if( tid == 0 ) s[n - 1] = 0.0f;
+
+    // Down-sweep: active threads do the swap-and-add.
+    for (int d = 1; d < n; d <<= 1) {
+        offset >>= 1;                    // stride halves each level
+        __syncthreads();
+        if (tid < d) {
+            int l = offset*(2*tid + 1) - 1;
+            int r = offset*(2*tid + 2) - 1;
+            float t = s[l];
+            s[l] = s[r];
+            s[r] += t;
+        }
+    }
+    __syncthreads();
+
+    // Write back, guarded against the padded tail.
+    if (2*tid     < N) out[2*tid]     = s[2*tid];
+    if (2*tid + 1 < N) out[2*tid + 1] = s[2*tid + 1];
 }
 
 // ============================================================================
