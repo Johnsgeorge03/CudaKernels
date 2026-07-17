@@ -116,6 +116,74 @@ int main() {
         CUDA_CHECK(cudaFree(d_blockSums));
     }
 
+    // ---- Multi-block: Blelloch pass-1 variant (A/B vs scan_full) -----------
+    {
+        std::vector<float> h_in(N_big), h_ref(N_big), h_out(N_big);
+        fill(h_in);
+        scanInclusiveCPU(h_in.data(), h_ref.data(), N_big);
+
+        float *d_in, *d_out, *d_blockSums;
+        CUDA_CHECK(cudaMalloc(&d_in,  N_big * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_out, N_big * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_blockSums, scanNumBlocks(N_big) * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), N_big * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        launchScanFullBlelloch(d_in, d_out, d_blockSums, N_big);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N_big * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+
+        bool ok = compareResults(h_out.data(), h_ref.data(), N_big, 1.0f);
+        std::printf("Full scan (Blelloch p1) (N = %d): %s\n",
+                    N_big, ok ? "PASSED" : "FAILED");
+        allPassed &= ok;
+
+        double ms = benchmarkMs([&] {
+            launchScanFullBlelloch(d_in, d_out, d_blockSums, N_big);
+        });
+        reportPerf("scan_full_blelloch", ms, 2.0 * N_big * sizeof(float), 0.0);
+
+        CUDA_CHECK(cudaFree(d_in));
+        CUDA_CHECK(cudaFree(d_out));
+        CUDA_CHECK(cudaFree(d_blockSums));
+    }
+
+    // ---- Multi-block: Blelloch pass 1 + bank-conflict-free padding ---------
+    {
+        std::vector<float> h_in(N_big), h_ref(N_big), h_out(N_big);
+        fill(h_in);
+        scanInclusiveCPU(h_in.data(), h_ref.data(), N_big);
+
+        float *d_in, *d_out, *d_blockSums;
+        CUDA_CHECK(cudaMalloc(&d_in,  N_big * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_out, N_big * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_blockSums, scanNumBlocks(N_big) * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), N_big * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        launchScanFullBlellochPadded(d_in, d_out, d_blockSums, N_big);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, N_big * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+
+        bool ok = compareResults(h_out.data(), h_ref.data(), N_big, 1.0f);
+        std::printf("Full scan (Blelloch pad) (N = %d): %s\n",
+                    N_big, ok ? "PASSED" : "FAILED");
+        allPassed &= ok;
+
+        double ms = benchmarkMs([&] {
+            launchScanFullBlellochPadded(d_in, d_out, d_blockSums, N_big);
+        });
+        reportPerf("scan_full_blelloch_pad", ms, 2.0 * N_big * sizeof(float), 0.0);
+
+        CUDA_CHECK(cudaFree(d_in));
+        CUDA_CHECK(cudaFree(d_out));
+        CUDA_CHECK(cudaFree(d_blockSums));
+    }
+
     std::printf("Scan: %s\n", allPassed ? "ALL PASSED" : "FAILURES");
     return allPassed ? 0 : 1;
 }

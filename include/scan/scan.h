@@ -28,6 +28,18 @@ void launchScanBlelloch(const float* d_in, float* d_out, int N);
 // need the block-sums scan to recurse.
 void launchScanFull(const float* d_in, float* d_out, float* d_blockSums, int N);
 
+// Same three-pass structure as launchScanFull, but pass 1 uses the work-efficient
+// Blelloch block scan (O(N)) in place of Hillis-Steele (O(N log N)). Passes 2 and 3
+// are shared verbatim. Benchmark this against launchScanFull to see whether the
+// work saving survives Blelloch's extra barriers and bank conflicts on this GPU.
+void launchScanFullBlelloch(const float* d_in, float* d_out, float* d_blockSums, int N);
+
+// As launchScanFullBlelloch, but pass 1 remaps every shared index i to
+// i + (i >> 5), inserting a pad word every 32 to break the bank conflicts the
+// 2^d strides cause (up to 32-way). Only variable changed vs launchScanFullBlelloch.
+void launchScanFullBlellochPadded(const float* d_in, float* d_out,
+                                  float* d_blockSums, int N);
+
 // Number of blocks (== required length of the d_blockSums scratch array) that
 // launchScanFull will use for a given N. Defined in scan.cu next to the geometry.
 int scanNumBlocks(int N);
