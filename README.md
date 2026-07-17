@@ -18,12 +18,17 @@ A collection of optimized CUDA kernel implementations for numerical operations, 
   - Naive (thread-per-row, uncoalesced)
   - Warp-per-row (coalesced loads + warp-shuffle reduction)
   - Warp-per-row with `x` staged in shared memory (a measured negative result — see Performance Notes)
+- **Prefix Sum / Scan** (`src/scan/scan.cu`)
+  - Single-block Hillis-Steele (inclusive, O(n log n) work)
+  - Single-block Blelloch (exclusive, work-efficient O(n) up/down-sweep)
+  - Multi-block 3-pass scan (scan chunks → scan block totals → add offsets), with three pass-1 variants: Hillis-Steele, Blelloch, and Blelloch with conflict-free padded indexing
 
 Interactive visualizations (download and open in a browser):
 
 - [docs/register_tiled_matmul_viz.html](docs/register_tiled_matmul_viz.html) — step-through of the register-tiled matmul kernel (cooperative tile loads, barriers, per-thread 2x2 accumulation)
 - [docs/bank_conflict_viz.html](docs/bank_conflict_viz.html) — shared-memory bank conflicts and why the +1 padding fixes them (animated bank queues, unpadded vs padded side by side)
 - [docs/memory_hierarchy_occupancy_viz.html](docs/memory_hierarchy_occupancy_viz.html) — the GPU memory hierarchy (DRAM / L2 / L1 / shared / registers) plus an interactive occupancy calculator; steps through why manually caching data that already fits in L2 makes a kernel slower
+- [docs/blelloch_scan_tree_viz.html](docs/blelloch_scan_tree_viz.html) — step-through of the Blelloch work-efficient scan: the implicit reduction tree overlaid on the array, up-sweep, root clear, and down-sweep, with the `ai`/`bi` index math shown live
 
 ## Requirements
 
@@ -80,31 +85,37 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 ├── include/
 │   ├── core/
 │   │   └── cuda_utils.h         # CUDA_CHECK error handling
-│   └── linalg/
-│       ├── matmul.h
-│       ├── dotprod.h
-│       ├── transpose.h
-│       └── gemv.h
+│   ├── linalg/
+│   │   ├── matmul.h
+│   │   ├── dotprod.h
+│   │   ├── transpose.h
+│   │   └── gemv.h
+│   └── scan/
+│       └── scan.h
 ├── src/
-│   └── linalg/
-│       ├── matmul_naive.cu
-│       ├── matmul_tiled.cu      # shared-memory tiled + register tiled
-│       ├── dotprod.cu
-│       ├── transpose.cu         # naive + tiled + padded
-│       └── gemv.cu              # naive + warp-per-row + shared-x
+│   ├── linalg/
+│   │   ├── matmul_naive.cu
+│   │   ├── matmul_tiled.cu      # shared-memory tiled + register tiled
+│   │   ├── dotprod.cu
+│   │   ├── transpose.cu         # naive + tiled + padded
+│   │   └── gemv.cu              # naive + warp-per-row + shared-x
+│   └── scan/
+│       └── scan.cu              # Hillis-Steele + Blelloch + 3-pass multi-block
 ├── tests/
 │   ├── test_utils.h             # shared correctness + benchmark helpers
 │   ├── test_matmul.cu
 │   ├── test_dotprod.cu
 │   ├── test_transpose.cu
-│   └── test_gemv.cu
+│   ├── test_gemv.cu
+│   └── test_scan.cu
 ├── scripts/
 │   └── plot_perf.py             # benchmark visualization (matplotlib)
 ├── docs/
 │   ├── perf.png                 # benchmark chart (generated)
 │   ├── register_tiled_matmul_viz.html   # interactive kernel walkthrough
 │   ├── bank_conflict_viz.html           # bank conflicts + padding fix
-│   └── memory_hierarchy_occupancy_viz.html  # memory hierarchy + occupancy calculator
+│   ├── memory_hierarchy_occupancy_viz.html  # memory hierarchy + occupancy calculator
+│   └── blelloch_scan_tree_viz.html      # Blelloch scan tree walkthrough
 └── CMakeLists.txt
 ```
 
@@ -127,6 +138,12 @@ GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift 
     1. **L2 already had it.** `x` is 16 KB and re-read by all 4096 rows, so after the first touch it lives permanently in the 1.5 MB chip-wide L2 — the staging loop's global reads hit L2 anyway, saving zero DRAM traffic while adding 4096 loads + 4096 shared stores + a `__syncthreads()` to every block.
     2. **Occupancy collapse.** The 16 KB/block dynamic shared allocation lets only ⌊96 KB / 16 KB⌋ = 6 blocks fit per SM, versus the 16 the thread budget (2048/128) allows: 24 resident warps instead of 64 (100% → 37.5% occupancy), so the SM has far fewer warps to switch to while `A`'s loads stall.
   - Takeaway: shared memory is a *manually managed* scratchpad rented from the SM's 96 KB budget, not a free cache. Spend it only to save traffic the caches can't absorb (matmul tiles, convolution halos) — never to duplicate a small read-only vector that already fits in L2. See [docs/memory_hierarchy_occupancy_viz.html](docs/memory_hierarchy_occupancy_viz.html) for the interactive walkthrough.
+- **Prefix sum / scan** (N = 1M floats, 3-pass multi-block, inclusive): Hillis-Steele pass 1 ~20–31 GB/s → Blelloch pass 1 ~21–31 GB/s → Blelloch + padded indexing ~30–45 GB/s end-to-end (absolute numbers swing ~50% with laptop clock state; the padded variant is consistently ~1.45–1.5× the baseline in same-run A/B, which is the number to trust).
+  - Scan is the first kernel here that is *not* embarrassingly parallel: `out[i]` depends on all elements before it, so blocks coordinate through three launches (scan each 1024-chunk → exclusive-scan the block totals → broadcast offsets back). Kernel boundaries are the only cheap grid-wide sync.
+  - nvprof: pass 1 is ~80% of runtime, and it runs at ~26 GB/s while the pass-3 streaming kernel (`out[i] += offset`, no barriers) hits ~117 GB/s on the same data volume — pass 1 is **barrier/shared-memory-bound, not DRAM-bound**.
+  - Swapping the work-efficient Blelloch scan (O(n) adds vs O(n log n)) into pass 1 bought only **1.07×**: both algorithms hit ~20 `__syncthreads()` barriers per block, and barriers — not arithmetic — dominate. Big-O said huge; the wall clock said 7%.
+  - Padding the shared indices (`i → i + (i>>5)`, one pad word per 32) removed the up-to-32-way bank conflicts of Blelloch's `2^d` strides and bought **1.7×** on pass 1 (311 → 182 µs) — ten times more than work-efficiency. Same coprime-stride principle as the transpose `[TILE][TILE+1]` pad, in 1-D form.
+  - Known headroom (left on the table deliberately): the `(2*tid, 2*tid+1)` global load layout is stride-2 (imperfectly coalesced; the `tid`/`tid+n/2` layout fixes it), and pass 3 is a whole extra read-modify-write sweep that a fused or single-pass (decoupled-lookback) design would eliminate. See [docs/blelloch_scan_tree_viz.html](docs/blelloch_scan_tree_viz.html) for the tree walkthrough.
 
 ## Troubleshooting
 
