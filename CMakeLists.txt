@@ -24,6 +24,7 @@ add_library(cuda_kernels STATIC
     src/linalg/transpose.cu
     src/linalg/gemv.cu
     src/scan/scan.cu
+    src/stencil/conv.cu
 )
 target_include_directories(cuda_kernels PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
@@ -43,6 +44,8 @@ add_kernel_test(test_dotprod)
 add_kernel_test(test_transpose)
 add_kernel_test(test_gemv)
 add_kernel_test(test_scan)
+add_kernel_test(test_conv1d)
+add_kernel_test(test_conv2d)
 
 message(STATUS "CUDA Kernels Build Configuration:")
 message(STATUS "  CUDA compiler: ${CMAKE_CUDA_COMPILER}")

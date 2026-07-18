@@ -22,6 +22,12 @@ A collection of optimized CUDA kernel implementations for numerical operations, 
   - Single-block Hillis-Steele (inclusive, O(n log n) work)
   - Single-block Blelloch (exclusive, work-efficient O(n) up/down-sweep)
   - Multi-block 3-pass scan (scan chunks → scan block totals → add offsets), with three pass-1 variants: Hillis-Steele, Blelloch, and Blelloch with conflict-free padded indexing
+- **1D Convolution** — stencil (`src/stencil/conv.cu`)
+  - Naive (one thread per output, mask + input from global memory)
+  - Constant-memory mask (`__constant__`, warp-broadcast constant cache)
+  - Shared-memory tiled (input staged with halo, zero padding baked into the tile)
+  - Tiled + compile-time radius (`template <int R>`, fully unrolled tap loop)
+  - 2D variants (constant mask, halo-ring tile) scaffolded, in progress
 
 Interactive visualizations (download and open in a browser):
 
@@ -90,8 +96,10 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   │   ├── dotprod.h
 │   │   ├── transpose.h
 │   │   └── gemv.h
-│   └── scan/
-│       └── scan.h
+│   ├── scan/
+│   │   └── scan.h
+│   └── stencil/
+│       └── conv.h
 ├── src/
 │   ├── linalg/
 │   │   ├── matmul_naive.cu
@@ -99,15 +107,19 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   │   ├── dotprod.cu
 │   │   ├── transpose.cu         # naive + tiled + padded
 │   │   └── gemv.cu              # naive + warp-per-row + shared-x
-│   └── scan/
-│       └── scan.cu              # Hillis-Steele + Blelloch + 3-pass multi-block
+│   ├── scan/
+│   │   └── scan.cu              # Hillis-Steele + Blelloch + 3-pass multi-block
+│   └── stencil/
+│       └── conv.cu              # 1D naive/const/tiled/unrolled + 2D (in progress)
 ├── tests/
 │   ├── test_utils.h             # shared correctness + benchmark helpers
 │   ├── test_matmul.cu
 │   ├── test_dotprod.cu
 │   ├── test_transpose.cu
 │   ├── test_gemv.cu
-│   └── test_scan.cu
+│   ├── test_scan.cu
+│   ├── test_conv1d.cu           # correctness + perf + --sweep radius diagnostics
+│   └── test_conv2d.cu
 ├── scripts/
 │   └── plot_perf.py             # benchmark visualization (matplotlib)
 ├── docs/
@@ -144,6 +156,11 @@ GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift 
   - Swapping the work-efficient Blelloch scan (O(n) adds vs O(n log n)) into pass 1 bought only **1.07×**: both algorithms hit ~20 `__syncthreads()` barriers per block, and barriers — not arithmetic — dominate. Big-O said huge; the wall clock said 7%.
   - Padding the shared indices (`i → i + (i>>5)`, one pad word per 32) removed the up-to-32-way bank conflicts of Blelloch's `2^d` strides and bought **1.7×** on pass 1 (311 → 182 µs) — ten times more than work-efficiency. Same coprime-stride principle as the transpose `[TILE][TILE+1]` pad, in 1-D form.
   - Known headroom (left on the table deliberately): the `(2*tid, 2*tid+1)` global load layout is stride-2 (imperfectly coalesced; the `tid`/`tid+n/2` layout fixes it), and pass 3 is a whole extra read-modify-write sweep that a fused or single-pass (decoupled-lookback) design would eliminate. See [docs/blelloch_scan_tree_viz.html](docs/blelloch_scan_tree_viz.html) for the tree walkthrough.
+- **1D Convolution** (N = 16.7M floats, 9-tap mask, zero-padded): naive ~29 GB/s → constant-memory mask ~72–82 GB/s → shared-tiled ~77–87 GB/s → tiled + unrolled ~104–112 GB/s effective bandwidth — which is the streaming floor (read n, write n at the rate the card actually sustains), i.e. fully memory-bound with the arithmetic hidden. "Effective" counts ideal traffic (8 bytes/output); the mask and halo re-reads are precisely what the kernel must keep out of DRAM.
+  - Constant memory beat global-memory mask reads **2.8×** — not because the 36-byte mask was far away (it sat in L2 either way), but because the warp-uniform `c_mask1d[j+r]` read broadcasts from the per-SM constant cache and folds into the FMA as an operand: 9 of 18 load instructions and 9 L2 round-trips removed from a 9-deep dependency chain.
+  - A radius sweep (r = 1, 2, 4, 8; `test_conv1d --sweep`) decomposed every variant's time into a shared **~1.15–1.2 ms floor** (moving 128 MB at ~110–120 GB/s) plus a **per-tap price set by where the tap's operands live**: ~0.45 ms/tap for two L2 trips (naive), ~0.10 for one L2 trip (const), ~0.04 for shared memory (tiled).
+  - Tiling has a fixed cost (tile load + `__syncthreads()`), so it only wins once the mask amortizes it: const wins at r ≤ 2, tiled from r = 4, 1.47× at r = 8. The gemv shared-x lesson sharpened into a rule: shared memory is a purchase, paid for by reuse × per-access saving.
+  - A runtime-radius loop cannot unroll; `template <int R>` + `#pragma unroll` deleted the per-tap loop bookkeeping and let all 2R+1 shared-memory loads issue together — **1.4×** over the generic tiled kernel, landing on the memory floor with time essentially flat from 3 to 9 taps (1.16 → 1.20 ms). Common radii are dispatched via a `switch`; other radii fall back to the generic kernel.
 
 ## Troubleshooting
 

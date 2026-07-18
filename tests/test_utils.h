@@ -19,7 +19,10 @@ inline bool compareResults(const float* gpu,
     for (int i = 0; i < size; ++i) {
         float diff = std::fabs(gpu[i] - cpu[i]);
 
-        if (diff > tolerance) {
+        // Written as !(diff <= tol) rather than (diff > tol) so NaN results
+        // fail: every comparison with NaN is false, so a NaN diff would
+        // silently PASS the (diff > tol) form.
+        if (!(diff <= tolerance)) {
             std::printf("Mismatch at %d: GPU = %f, CPU = %f, diff = %f\n",
                         i, gpu[i], cpu[i], diff);
             return false;
