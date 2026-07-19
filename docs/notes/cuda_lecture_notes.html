@@ -1589,7 +1589,13 @@ by the <code>@P</code> guards. This is the machinery of predication from chapter
 by name.</p>
 
 <p>The operand form <code>c[<i>bank</i>][<i>offset</i>]</code> reads constant memory: bank number
-first, byte offset second. Two banks appear constantly. <b>Bank 0</b> is where the launch places
+first, byte offset second. A caution about the word: these banks have <i>no relation</i> to the
+32 shared-memory banks of chapter 3.3. That "bank" is a statement about physical wiring — 32
+interleaved slices, conflicts when lanes collide. A constant bank is merely a numbered segment of
+constant memory, a labeled drawer; there is no interleaving and no conflict concept (the constant
+hazard is a different one: lanes reading <i>different</i> addresses lose the broadcast and
+serialize, as chapter 10 discussed). Same word, unrelated meanings. Two banks turn up on nearly
+every line of this chapter. <b>Bank 0</b> is where the launch places
 everything a kernel is told at startup: the block dimensions live near the front (on this chip
 <code>c[0x0][0x8]</code> is <code>blockDim.x</code>), and the kernel's own arguments start at
 offset <code>0x140</code> — for a 2D convolution call, <code>in</code> at 0x140, <code>out</code>
@@ -1911,7 +1917,77 @@ floor" — F2's ~190 include 81 shared-memory loads, and chapter 11 already show
 pipe throughput accounts for ~3 of its 3.9 ms. When the census stops predicting the time, the
 census is telling you which hardware pipe took over as the wall.</p>
 
-<h2>12.5 The working method</h2>
+<h2>12.5 Registers, and what happens when they run out</h2>
+
+<p>The listings above name registers as if there were one R0, but there is one <i>per thread</i>.
+When a SASS line says <code>FFMA R0, R2, c[0x3][0x0], RZ</code>, each of the warp's 32 lanes
+executes it against its own private R0 and R2 — one instruction, thirty-two separate datasets.
+This is chapter 2's lockstep model seen from the register side, and it explains a contrast worth
+making explicit: <code>c[0x0][0x8]</code> names <i>one</i> value that every thread reads
+identically, which is why it can be an operand costing nothing; <code>R4</code> names as many
+different values as there are resident threads. Warp-uniform facts belong in constant banks;
+per-thread state must live in registers — and registers are the one resource no thread can share.
+(The single, deliberate exception is the shuffle instruction of chapter 6, which exists precisely
+because registers are otherwise sealed off per lane.)</p>
+
+<p>Physically, each SM owns one register file of 65,536 32-bit registers, and every resident
+thread leases a private slice for its whole lifetime. That arithmetic is the register half of
+occupancy: hosting the full 2048 threads means at most 65,536 / 2048 = 32 registers per thread,
+and a kernel needing 64 caps its SM at half occupancy before issuing an instruction. The
+register-tiled matmul of chapter 5 spent from exactly this budget on purpose — many accumulators
+per thread, fewer threads, more reuse per thread. Separately from the occupancy budget there is a
+hard naming limit: the instruction encoding has room for register numbers 0 through 255, and 255
+is spent on RZ, so a single thread can name at most R0–R254.</p>
+
+<p>What happens when a kernel needs more values than its registers can hold? The compiler
+<i>spills</i>: it parks the excess in <b>local memory</b> — and the name is among CUDA's most
+misleading, because it describes scope, not location. Local memory is a per-thread private region
+carved out of the same DRAM that global memory lives in: the farthest, slowest storage on the
+card, wearing a friendly name. Spilled traffic does travel through L2, so a small, hot spill set
+is often caught by cache rather than paying full DRAM round trips, and the layout is interleaved
+so that when 32 lanes touch "their" copy of the same spilled variable the accesses coalesce into
+one transaction. The hardware makes spilling as cheap as spilling can be; it is still a real load
+instruction plus real latency in place of a free register name. Spills are visible with this
+chapter's own tools: they appear in SASS as <code>STL</code> and <code>LDL</code> (store/load
+<i>local</i>) — a fourth memory family alongside LDG, LDS, and LDC, and one the census will
+catch — and <code>ptxas</code> confesses them at build time if compiled with
+<code>-Xptxas -v</code>, which prints each kernel's register count and spill byte counts. Every
+kernel in this project reports zero.</p>
+
+<p>Registers have one more limitation, and it produces this card's most surprising demotion. A
+register is not <i>addressed</i>; it is <i>named</i>, as a fixed bit-field inside the 8-byte
+instruction encoding — <code>FFMA R4, R5, R6, R4</code> literally contains 4, 5, and 6 in its
+bits, decided at compile time. There is no instruction meaning "read register number R3+i": the
+schedulers must know an instruction's operands in advance (that is what the scoreboard tracks),
+so the machine simply has no indirect register access. Now consider an innocent per-thread
+array:</p>
+
+<pre><code>float tmp[10];
+#pragma unroll
+for (int i = 0; i &lt; 10; i++) tmp[i] = ...;   // unrolled: tmp[0], tmp[1], … — all literals</code></pre>
+
+<p>If every access resolves to a compile-time index, <code>tmp</code> was never really an array:
+the compiler splits it into ten independent scalar variables and each one gets a register name.
+The register-tiled matmul's per-thread accumulator block worked exactly this way — a small array,
+loops fully unrolled, four accumulators living in four registers. But if even one access uses an
+index the compiler cannot pin down at compile time, "which register?" has no compile-time answer,
+no instruction can name the target, and the whole array is demoted to local memory, where
+addressed loads can do the indexing. (For small arrays the compiler sometimes takes a middle
+path — keep the registers and compile <code>tmp[i]</code> into a chain of compares and selects,
+ten-ish instructions per access; a consolation prize, not a fix.)</p>
+
+<div class="warnbox"><span class="kb-t">TRAP</span><br>
+A per-thread array with a single runtime-indexed access silently moves from the register file to
+DRAM — the two ends of the memory hierarchy, with nothing in between. The symptom is a mysteriously
+slow kernel; the diagnosis is thirty seconds: grep the SASS for <code>LDL</code>/<code>STL</code>,
+or read the spill line from <code>-Xptxas -v</code>. The cure is the chapter's running theme —
+make the indices compile-time facts: constant bounds, <code>#pragma unroll</code>, and
+<code>template</code> parameters where the bound arrives at run time. This trap is armed for the
+upcoming histogram kernel, where giving each thread its own array of counters is the tempting
+first idea; the working tool there, privatization, gives the private copy to the <i>block</i> in
+shared memory instead.</div>
+
+<h2>12.6 The working method</h2>
 
 <p>Everything above reduces to a repeatable recipe, and it is the same one that diagnosed
 chapter 11 when the profiler was locked out:</p>
@@ -1940,7 +2016,11 @@ CUDA compiles twice: front end to portable PTX, then <code>ptxas</code> to the c
 and the optimization that matters happens in the second step, so judge performance only from SASS.
 A listing is readable with a dozen mnemonics, two special registers (RZ = zero, PT = true), and
 one addressing convention (bank 0 = launch arguments, bank 3 = your <code>__constant__</code>
-data). What the compiler knows at compile time decides everything: a known radius turned ten
+data — no relation to shared memory's banks). Registers are per-thread and finite: the SM's
+65,536 split among resident threads is the register half of occupancy, and overflow — or a
+runtime-indexed per-thread array, since registers are named at compile time, never indexed —
+spills to "local" memory, which is DRAM wearing a friendly name; <code>LDL</code>/<code>STL</code>
+in a listing is the tell. What the compiler knows at compile time decides everything: a known radius turned ten
 instructions per tap into two, a known divisor turned a twenty-instruction division into a
 multiply-and-shift, a known offset made mask loads vanish into FFMA operands. The census — grep
 counting instruction kinds — is a profiler nobody can lock: it found a two-character diff worth
@@ -2067,6 +2147,7 @@ median-of-samples timing.</p>
   <tr><td>c[bank][offset]</td><td>a constant-memory operand in SASS: bank 0 holds launch dimensions and kernel arguments (from 0x140), bank 3 holds <code>__constant__</code> variables</td></tr>
   <tr><td>XMAD</td><td>Pascal's 16-bit integer multiply-add; one 32-bit multiply (every <code>blockIdx.x*blockDim.x</code>) costs three of them</td></tr>
   <tr><td>RZ / PT</td><td>hardwired registers reading as zero / true — a free accumulator-start and a "no condition" guard, spent everywhere in compiled code</td></tr>
+  <tr><td>local memory (LDL / STL)</td><td>a per-thread private region physically in device DRAM (cached in L2); holds register spills and runtime-indexed per-thread arrays; its SASS load/store instructions — their presence in a listing is a warning</td></tr>
 </table>
 
 <h1><span class="chip">15</span>What comes next</h1>
