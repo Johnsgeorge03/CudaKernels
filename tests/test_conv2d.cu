@@ -46,6 +46,11 @@ static std::vector<float> makeTriangleMask2d(int r)
     for (int y = 0; y < K; ++y)
         for (int x = 0; x < K; ++x)
             m[y * K + x] = m1[y] * m1[x];
+    // The outer product is symmetric under both transpose and 180° rotation,
+    // so a kernel that indexes the mask transposed (or flipped) would still
+    // pass. Perturb one corner: (0, K-1) maps to (K-1, 0) under either
+    // symmetry, so those bugs now produce mismatches well above tolerance.
+    m[0 * K + (K - 1)] += 0.25f;
     return m;
 }
 
@@ -57,8 +62,9 @@ struct Variant {
 };
 
 static const Variant kVariants[] = {
-    { "conv2d_const", launchConv2dConst },
-    { "conv2d_tiled", launchConv2dTiled },
+    { "conv2d_const",  launchConv2dConst },
+    { "conv2d_tiled",  launchConv2dTiled },
+    { "conv2d_tiledU", launchConv2dTiledUnroll },
 };
 
 // Signed, bounded values in [-1.5, 1.5].

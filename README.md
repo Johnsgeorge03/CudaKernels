@@ -27,7 +27,10 @@ A collection of optimized CUDA kernel implementations for numerical operations, 
   - Constant-memory mask (`__constant__`, warp-broadcast constant cache)
   - Shared-memory tiled (input staged with halo, zero padding baked into the tile)
   - Tiled + compile-time radius (`template <int R>`, fully unrolled tap loop)
-  - 2D variants (constant mask, halo-ring tile) scaffolded, in progress
+- **2D Convolution** — stencil (`src/stencil/conv.cu`)
+  - Constant-memory mask, one thread per pixel, `__restrict__` read-only loads
+  - Shared-memory tiled (32x8 blocks, halo ring, flatten-and-stride load, zero padding baked into the tile)
+  - Tiled + compile-time radius (`template <int R>`, all (2R+1)² taps unrolled flat)
 
 Interactive visualizations (download and open in a browser):
 
@@ -35,6 +38,7 @@ Interactive visualizations (download and open in a browser):
 - [docs/bank_conflict_viz.html](docs/bank_conflict_viz.html) — shared-memory bank conflicts and why the +1 padding fixes them (animated bank queues, unpadded vs padded side by side)
 - [docs/memory_hierarchy_occupancy_viz.html](docs/memory_hierarchy_occupancy_viz.html) — the GPU memory hierarchy (DRAM / L2 / L1 / shared / registers) plus an interactive occupancy calculator; steps through why manually caching data that already fits in L2 makes a kernel slower
 - [docs/blelloch_scan_tree_viz.html](docs/blelloch_scan_tree_viz.html) — step-through of the Blelloch work-efficient scan: the implicit reduction tree overlaid on the array, up-sweep, root clear, and down-sweep, with the `ai`/`bi` index math shown live
+- [docs/conv2d_halo_tiling_viz.html](docs/conv2d_halo_tiling_viz.html) — 2D convolution halo tiling: click a block, step the flatten-and-stride load passes (with zero padding at image edges), hover threads to see their compute windows, and toggle the classic wrong-stride bug to see what it actually reads
 
 ## Requirements
 
@@ -110,7 +114,7 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   ├── scan/
 │   │   └── scan.cu              # Hillis-Steele + Blelloch + 3-pass multi-block
 │   └── stencil/
-│       └── conv.cu              # 1D naive/const/tiled/unrolled + 2D (in progress)
+│       └── conv.cu              # 1D + 2D: naive/const/tiled/unrolled variants
 ├── tests/
 │   ├── test_utils.h             # shared correctness + benchmark helpers
 │   ├── test_matmul.cu
@@ -127,7 +131,8 @@ python scripts/plot_perf.py --peak-bw 192 --peak-flops 3900   # writes perf.png
 │   ├── register_tiled_matmul_viz.html   # interactive kernel walkthrough
 │   ├── bank_conflict_viz.html           # bank conflicts + padding fix
 │   ├── memory_hierarchy_occupancy_viz.html  # memory hierarchy + occupancy calculator
-│   └── blelloch_scan_tree_viz.html      # Blelloch scan tree walkthrough
+│   ├── blelloch_scan_tree_viz.html      # Blelloch scan tree walkthrough
+│   └── conv2d_halo_tiling_viz.html      # 2D conv halo tiling + load passes
 └── CMakeLists.txt
 ```
 
@@ -161,6 +166,12 @@ GTX 1060 Max-Q, sm_61, ~192 GB/s peak DRAM bandwidth. Laptop part: clocks drift 
   - A radius sweep (r = 1, 2, 4, 8; `test_conv1d --sweep`) decomposed every variant's time into a shared **~1.15–1.2 ms floor** (moving 128 MB at ~110–120 GB/s) plus a **per-tap price set by where the tap's operands live**: ~0.45 ms/tap for two L2 trips (naive), ~0.10 for one L2 trip (const), ~0.04 for shared memory (tiled).
   - Tiling has a fixed cost (tile load + `__syncthreads()`), so it only wins once the mask amortizes it: const wins at r ≤ 2, tiled from r = 4, 1.47× at r = 8. The gemv shared-x lesson sharpened into a rule: shared memory is a purchase, paid for by reuse × per-access saving.
   - A runtime-radius loop cannot unroll; `template <int R>` + `#pragma unroll` deleted the per-tap loop bookkeeping and let all 2R+1 shared-memory loads issue together — **1.4×** over the generic tiled kernel, landing on the memory floor with time essentially flat from 3 to 9 taps (1.16 → 1.20 ms). Common radii are dispatched via a `switch`; other radii fall back to the generic kernel.
+- **2D Convolution** (4096 x 4096, 9x9 mask = 81 taps, zero-padded): const-mask 15.0 ms → + `__restrict__` 10.6 ms → shared-tiled 8.4 ms → tiled + unrolled **3.89 ms** (34.5 GB/s effective / 698 GFLOP/s). At r = 4 the arithmetic intensity (162 flops / 8 ideal bytes ≈ 20 flop/B) sits exactly on this card's roofline ridge (3900/192), so both GB/s and GFLOP/s are reported. Each step removed a different wall, and each wall was only visible after the previous one fell:
+  1. **`__restrict__` → 1.4×.** On sm_61 plain global loads bypass the per-SM L1/tex cache entirely (L2 every time); since `in`/`out` could alias, the compiler may not use the read-only (`LDG.CI`) path. With ~5.4 GB of L2 traffic over 14.8 ms the kernel was saturating L2 bandwidth (~370 GB/s) while DRAM idled at 9 GB/s. Two `__restrict__` qualifiers rerouted all 81 taps through the L1/tex path.
+  2. **Halo tile → 1.3×.** SASS showed the const kernel spending ~10 instructions per tap, only 1 of them the FMA — the zero-padding bounds check alone was ~4 (predicated, so no divergence cost; the price is issue slots, paid by the 98% of warps that never touch an edge). Staging a (TILE+2r)-sided tile in shared memory with the zeros baked in at load time deleted the per-tap checks. Global reads drop from 81 to 2.25 per pixel.
+  3. **`template <int R>` → 2.2×.** With runtime r the compiler's 16-wide unrolled fast path is dead code at K = 9 taps/row (it requires >12), so every row ran remainder loops with per-row address setup — and each tap needed a separate indexed constant-memory load (`LDC`) for its mask weight. With R compile-time, the compiled R = 4 kernel is exactly **81 `LDS` + 81 `FFMA` per pixel** — each mask weight folded into its FFMA as a constant operand, zero loop overhead. Now ~75% of runtime is the shared-memory pipe itself (~3 ms of one-warp-load-per-cycle-per-SM), i.e. the kernel sits near the LDS roofline.
+  4. **Block shape 32x8, not 16x16.** In a 16x16 block a warp spans two 16-wide rows, so its two halves read addresses 24 apart — lanes 0–7 and 24–31 collide on the same banks: a 2-way bank conflict on *every* shared read. Padding can't fix a warp-shape problem (any usable stride still overlaps); making blocks 32 wide aligns each warp with one row, conflict-free by construction. Measured effect at step 3's 8.4 ms: **zero** — the conflict was hiding below the instruction-issue wall. After step 4 it's load-bearing: with square blocks the unrolled kernel's LDS floor would be ~6 ms instead of ~3.
+  - Known headroom: register reuse (each thread computes several neighboring outputs whose 9x9 windows overlap 8/9 — the matmul register-tiling idea in stencil form). See [docs/conv2d_halo_tiling_viz.html](docs/conv2d_halo_tiling_viz.html) for the interactive halo/load-pass walkthrough. Diagnostics throughout: same-run A/B + `cuobjdump -sass` instruction census (nvprof metrics are blocked on Windows without admin counter permissions).
 
 ## Troubleshooting
 

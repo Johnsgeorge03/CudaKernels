@@ -32,6 +32,8 @@ void setConv2dMask(const float* h_mask, int radius) {
 // Launch geometry: one output element per thread.
 #define CONV1D_BLOCK 256
 #define CONV2D_TILE  16     // 16x16 = 256 threads per block
+#define CONV2D_TILE_X 32
+#define CONV2D_TILE_Y 8
 
 // ----------------------------------------------------------------------------
 // A: naive 1D. One thread per output element; mask read from global memory.
@@ -148,12 +150,24 @@ __global__ void conv1dTiledUnrollKernel(const float* in, float* out, int n)
 // from c_mask2d, input straight from global memory. Row-major: pixel (y, x)
 // is in[y * W + x].
 // ----------------------------------------------------------------------------
-__global__ void conv2dConstKernel(const float* in, float* out,
+__global__ void conv2dConstKernel(const float* __restrict__ in, float* __restrict__ out,
                                   int H, int W, int r)
 {
-    // TODO (you): x from blockIdx.x/threadIdx.x, y from blockIdx.y/threadIdx.y;
-    // guard x < W && y < H; double loop dy, dx = -r..r with the zero-padding
-    // bounds check on (y+dy, x+dx); mask element c_mask2d[(dy+r)*(2r+1)+(dx+r)].
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+
+    float sum = 0.0f;
+    for ( int dy = -r; dy <= r; dy++){
+        for (int dx = -r; dx <= r; dx++){
+            int idin = (row + dy) * W + ( col + dx);
+            if ( row + dy < H && row + dy >= 0 && 
+                 col + dx < W && col + dx >= 0 )
+                sum += in[idin] * c_mask2d[(dy + r)*(2*r + 1) + (dx + r)];
+        }
+    }
+
+    if( row < H  && col < W )
+        out[row * W + col] = sum;
 }
 
 // ----------------------------------------------------------------------------
@@ -182,6 +196,83 @@ __global__ void conv2dTiledKernel(const float* in, float* out,
     // TODO (you): flatten-and-stride load incl. halo + zero padding; barrier;
     // accumulate over the (2r+1)^2 window from the tile; write out[y*W + x]
     // if inside the image.
+    // Load to shared memory
+    int tid = threadIdx.y * CONV2D_TILE_X + threadIdx.x;
+    int side_c = CONV2D_TILE_X + 2 * r;
+    int side_r = CONV2D_TILE_Y + 2 * r;
+    int row = 0, col = 0;
+    for( int s = tid; s < side_c * side_r; s += blockDim.x * blockDim.y ){
+        row = blockIdx.y*CONV2D_TILE_Y - r + s/side_c;
+        col = blockIdx.x*CONV2D_TILE_X - r + s%side_c;
+        if( row >= 0 && row < H && col >= 0 && col < W )
+            tile[s] = in[row * W + col];
+        else
+            tile[s] = 0.0f;
+    }
+    __syncthreads();
+
+    // Compute
+    float sum = 0.0f;
+    for ( int dy = -r; dy <= r; dy++){
+        for (int dx = -r; dx <= r; dx++){
+            int idx = (threadIdx.y + r + dy) * side_c + ( threadIdx.x + + r + dx);
+            sum += tile[idx] * c_mask2d[(dy + r)*(2*r + 1) + (dx + r)];
+        }
+    }
+
+    row = blockDim.y * blockIdx.y + threadIdx.y;
+    col = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if( row < H  && col < W )
+        out[row * W + col] = sum;
+}
+
+// ----------------------------------------------------------------------------
+// F2: tiled 2D with a COMPILE-TIME radius — the 2D twin of kernel F. Body:
+// your conv2dTiledKernel verbatim, every `r` becoming `R` (no runtime r
+// parameter), `#pragma unroll` on the line before EACH tap loop. With R known
+// at compile time the 81 taps flatten into straight-line code: the mask index
+// (dy+R)*(2R+1)+(dx+R) is a constant per tap, so each weight rides inside its
+// FFMA as a c[bank][offset] operand — the LDC instruction disappears entirely
+// (see the 1D unrolled SASS: `FFMA R4, R5, c[0x3][0x4], R4`).
+// ----------------------------------------------------------------------------
+template <int R>
+__global__ void conv2dTiledUnrollKernel(const float* __restrict__ in,
+                                        float* __restrict__ out, int H, int W)
+{
+    extern __shared__ float tile[];   // (TILE_X + 2R) * (TILE_Y + 2R) floats
+
+    // conv2dTiledKernel with r -> R and both tap loops unrolled.
+    int tid = threadIdx.y * CONV2D_TILE_X + threadIdx.x;
+    int side_c = CONV2D_TILE_X + 2 * R;
+    int side_r = CONV2D_TILE_Y + 2 * R;
+    int row = 0, col = 0;
+    for( int s = tid; s < side_c * side_r; s += blockDim.x * blockDim.y ){
+        row = blockIdx.y*CONV2D_TILE_Y - R + s/side_c;
+        col = blockIdx.x*CONV2D_TILE_X - R + s%side_c;
+        if( row >= 0 && row < H && col >= 0 && col < W )
+            tile[s] = in[row * W + col];
+        else
+            tile[s] = 0.0f;
+    }
+    __syncthreads();
+
+    // Compute
+    float sum = 0.0f;
+    #pragma unroll
+    for ( int dy = -R; dy <= R; dy++){
+        #pragma unroll
+        for (int dx = -R; dx <= R; dx++){
+            int idx = (threadIdx.y + R + dy) * side_c + ( threadIdx.x + R + dx);
+            sum += tile[idx] * c_mask2d[(dy + R)*(2*R + 1) + (dx + R)];
+        }
+    }
+
+    row = blockDim.y * blockIdx.y + threadIdx.y;
+    col = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if( row < H  && col < W )
+        out[row * W + col] = sum;
 }
 
 // ----------------------------------------------------------------------------
@@ -228,10 +319,30 @@ void launchConv2dConst(const float* d_in, float* d_out, int H, int W, int r) {
 }
 
 void launchConv2dTiled(const float* d_in, float* d_out, int H, int W, int r) {
-    dim3 block(CONV2D_TILE, CONV2D_TILE);
-    dim3 grid((W + CONV2D_TILE - 1) / CONV2D_TILE,
-              (H + CONV2D_TILE - 1) / CONV2D_TILE);
-    size_t side = CONV2D_TILE + 2 * r;
-    conv2dTiledKernel<<<grid, block, side * side * sizeof(float)>>>(
+    dim3 block(CONV2D_TILE_X, CONV2D_TILE_Y);
+    dim3 grid((W + CONV2D_TILE_X - 1) / CONV2D_TILE_X,
+              (H + CONV2D_TILE_Y - 1) / CONV2D_TILE_Y);
+    size_t side_c = CONV2D_TILE_X + 2 * r;
+    size_t side_r = CONV2D_TILE_Y + 2 * r;
+    conv2dTiledKernel<<<grid, block, side_c * side_r * sizeof(float)>>>(
         d_in, d_out, H, W, r);
+}
+
+// Same enumerate-and-dispatch pattern as launchConv1dTiledUnroll: the template
+// needs R at compile time, r arrives at runtime, so a switch picks the
+// pre-compiled kernel and anything else falls back to the generic tiled one.
+void launchConv2dTiledUnroll(const float* d_in, float* d_out, int H, int W,
+                             int r) {
+    dim3 block(CONV2D_TILE_X, CONV2D_TILE_Y);
+    dim3 grid((W + CONV2D_TILE_X - 1) / CONV2D_TILE_X,
+              (H + CONV2D_TILE_Y - 1) / CONV2D_TILE_Y);
+    size_t smem = (CONV2D_TILE_X + 2 * r) * (CONV2D_TILE_Y + 2 * r)
+                  * sizeof(float);
+    switch (r) {
+    case 1: conv2dTiledUnrollKernel<1><<<grid, block, smem>>>(d_in, d_out, H, W); break;
+    case 2: conv2dTiledUnrollKernel<2><<<grid, block, smem>>>(d_in, d_out, H, W); break;
+    case 4: conv2dTiledUnrollKernel<4><<<grid, block, smem>>>(d_in, d_out, H, W); break;
+    case 8: conv2dTiledUnrollKernel<8><<<grid, block, smem>>>(d_in, d_out, H, W); break;
+    default: conv2dTiledKernel<<<grid, block, smem>>>(d_in, d_out, H, W, r); break;
+    }
 }

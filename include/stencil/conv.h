@@ -61,3 +61,11 @@ void launchConv2dConst(const float* d_in, float* d_out, int H, int W,
 // memory (output tile plus a halo ring around it).
 void launchConv2dTiled(const float* d_in, float* d_out, int H, int W,
                        int radius);
+
+// F2: as E, but the radius is a compile-time template parameter (dispatched
+// in the launcher for r = 1, 2, 4, 8; other radii fall back to E). The whole
+// (2R+1)^2 window unrolls flat: mask weights fold into the FFMAs as constant
+// operands (no separate mask load), loop bookkeeping vanishes — per tap
+// approximately one shared-memory load + one FFMA.
+void launchConv2dTiledUnroll(const float* d_in, float* d_out, int H, int W,
+                             int radius);

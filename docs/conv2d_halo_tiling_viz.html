@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>2D Convolution — Halo Tiling &amp; Flatten-and-Stride Loading</title>
+<style>
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 20px 28px 48px;
+    background: #f6f7fa; color: #222;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #555; margin: 0 0 16px; font-size: 14px; max-width: 1000px; line-height: 1.5; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 14px; font-size: 13.5px;
+  }
+  .controls button {
+    font-size: 14px; padding: 6px 14px; border-radius: 8px;
+    border: 1px solid #c8cdd6; background: #fff; cursor: pointer;
+  }
+  .controls button:hover { background: #eef1f6; }
+  .controls button.primary { background: #2b6fdb; color: #fff; border-color: #2b6fdb; }
+  .controls button:disabled { opacity: 0.45; cursor: default; }
+  .controls label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .controls .phasechip {
+    margin-left: auto; font-family: Consolas, monospace; font-size: 13px;
+    padding: 4px 10px; border-radius: 20px; background: #eef1f6; color: #333;
+  }
+  .controls .phasechip.load { background: #d6e6ff; color: #1b4f9b; }
+  .controls .phasechip.done { background: #d6f3df; color: #1e7a3d; }
+  #narration {
+    background: #fff; border-left: 4px solid #2b6fdb; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 14px; font-size: 14px; min-height: 40px; line-height: 1.55;
+    max-width: 1100px;
+  }
+  #narration b { color: #2b6fdb; }
+  #narration code { background: #f0f2f6; border-radius: 3px; padding: 1px 5px; font-size: 13px; }
+  #narration .warn { color: #c0392b; font-weight: 600; }
+  .stagerow { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .stage {
+    background: #fff; border: 1px solid #e1e4ea; border-radius: 10px;
+    padding: 8px 12px 12px; margin-bottom: 16px; overflow-x: auto;
+  }
+  .stage h3 { font-size: 14px; margin: 4px 2px 8px; color: #444; font-weight: 600; }
+  svg { display: block; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: #555; margin: 8px 4px 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 14px; border-radius: 4px; border: 1px solid #bbb; display: inline-block; }
+  .why {
+    background: #fff; border: 1px solid #e1e4ea;
+    border-radius: 10px; padding: 16px 22px; max-width: 1050px;
+    font-size: 14px; line-height: 1.65;
+  }
+  .why h2 { font-size: 17px; margin-top: 0; }
+  .why h3 { font-size: 14.5px; margin: 18px 0 4px; }
+  .why code { background: #f0f2f6; border-radius: 3px; padding: 0 4px; font-size: 13px; }
+  .why table { border-collapse: collapse; margin: 10px 0; }
+  .why td, .why th { border: 1px solid #d8dce3; padding: 5px 11px; font-size: 13px; text-align: center; }
+  .why th { background: #f0f2f6; }
+  .why li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<h1>2D Convolution &mdash; Halo Tiling &amp; Flatten-and-Stride Loading</h1>
+<p class="subtitle">
+  Scaled-down model: <b>TILE = 6</b> (6&times;6 = 36 threads per block), <b>r = 2</b> (5&times;5 mask),
+  image <b>26 &times; 17</b>. The real kernel uses TILE = 16, r = 4, image 4096&times;4096 &mdash; same logic, bigger numbers.
+  Left: the image in global memory, cut into blocks. Right: ONE block's shared-memory tile of side
+  6 + 2&middot;2 = <b>10</b>. <b>Click a block</b> (try a corner block!), then step the load passes,
+  then hover the tile's inner 6&times;6 to see each thread's compute window.
+</p>
+
+<div class="controls">
+  <button id="stepBtn" class="primary">Load pass 1 of 3</button>
+  <button id="resetBtn">Reset loads</button>
+  <label><input type="checkbox" id="bugChk"> stride-bug mode: address with 6 instead of 10</label>
+  <span class="phasechip" id="chip">select a block, then load</span>
+</div>
+
+<div id="narration">Click any block in the image on the left. Corner and edge blocks show why zero padding
+is baked in at load time.</div>
+
+<div class="stagerow">
+  <div class="stage">
+    <h3>Global memory: 26 &times; 17 image, 6&times;6 output blocks (grey cells = outside the image)</h3>
+    <svg id="imgSvg"></svg>
+    <div class="legend">
+      <span><span class="swatch" style="background:#d6e6ff"></span> selected block's 36 output pixels</span>
+      <span><span class="swatch" style="background:#ffe7c2"></span> halo ring (width r = 2)</span>
+      <span><span class="swatch" style="background:#f8d7da"></span> needed but outside image &rarr; 0.0f</span>
+    </div>
+  </div>
+  <div class="stage">
+    <h3>Shared memory: this block's 10 &times; 10 tile (labels = which thread loaded the slot)</h3>
+    <svg id="tileSvg"></svg>
+    <div class="legend">
+      <span><span class="swatch" style="background:#d6e6ff"></span> pass 1 (slots 0&ndash;35)</span>
+      <span><span class="swatch" style="background:#d6f3df"></span> pass 2 (36&ndash;71)</span>
+      <span><span class="swatch" style="background:#ffe7c2"></span> pass 3 (72&ndash;99, threads 28&ndash;35 idle)</span>
+      <span><span class="swatch" style="background:#f8d7da"></span> zero-filled (outside image)</span>
+      <span><span class="swatch" style="background:#fff;border:2px dashed #2b6fdb"></span> inner 6&times;6 = this block's outputs</span>
+    </div>
+  </div>
+</div>
+
+<div class="why">
+  <h2>Why it works &mdash; and the four ways it bites</h2>
+
+  <h3>The two mapping formulas (all the indexing there is)</h3>
+  <p>
+    <b>Loading</b> &mdash; treat the 10&times;10 tile as a flat list of 100 slots. Thread <code>t = ty*6+tx</code>
+    fills slots <code>s = t, t+36, t+72</code> (a loop: <code>for (s = t; s &lt; 100; s += 36)</code>). Each slot
+    unflattens to tile row <code>s / 10</code>, column <code>s % 10</code> (integer divide and remainder), which is global pixel
+    <code>(blockIdx.y*6 &minus; 2 + s/10,&nbsp; blockIdx.x*6 &minus; 2 + s%10)</code> &mdash; outside the image &rarr; store 0.0f.
+    Consecutive slots are consecutive columns, so the global reads coalesce along rows.
+  </p>
+  <p>
+    <b>Computing</b> &mdash; thread <code>(ty,tx)</code>'s window is simply tile rows <code>ty..ty+2r</code>,
+    columns <code>tx..tx+2r</code>: because the tile starts r pixels up-and-left of the output tile, the window's
+    <i>top-left corner</i> lands exactly at <code>(ty,tx)</code>. No bounds check anywhere &mdash; the zeros are already in the tile.
+  </p>
+
+  <h3>Scaled model vs the real kernel</h3>
+  <table>
+    <tr><th></th><th>this page</th><th>real kernel E</th></tr>
+    <tr><td>TILE (output side)</td><td>6</td><td>16</td></tr>
+    <tr><td>radius r</td><td>2 (25 taps)</td><td>4 (81 taps)</td></tr>
+    <tr><td>tile side = TILE+2r</td><td>10</td><td>24</td></tr>
+    <tr><td>slots vs threads</td><td>100 vs 36</td><td>576 vs 256</td></tr>
+    <tr><td>load passes</td><td>3 (last one partial)</td><td>3 (last one: 64 of 256 threads)</td></tr>
+    <tr><td>shared memory per block</td><td>400 B</td><td>2.3 KB (no occupancy hit)</td></tr>
+    <tr><td>global reads per output pixel</td><td>100/36 &asymp; 2.8</td><td>576/256 = 2.25 (vs 81 in kernel D)</td></tr>
+  </table>
+
+  <h3>The four ways it bites</h3>
+  <ul>
+    <li><b>The stride bug (toggle it above!).</b> The tile's row stride is the tile side (10 here, 24 for real),
+      NOT the block width. Address with the wrong stride and the window rows collapse onto each other and wrap &mdash;
+      plausible-looking, wrong everywhere. This is what the odd-size correctness cases catch.</li>
+    <li><b>Barrier before any read.</b> Slot 47 is loaded by thread 11, but read by many other threads' windows.
+      <code>__syncthreads()</code> between the load loop and the compute loop &mdash; no exceptions.</li>
+    <li><b>No early return.</b> A thread whose output pixel is outside the image (right/bottom edge blocks) must
+      STILL load its share of slots and STILL reach the barrier. Guard only the final <code>out[y*W+x] = sum</code> write.</li>
+    <li><b>Every slot gets written.</b> The zero-fill else-branch is not optional: shared memory starts as garbage,
+      and an unwritten halo slot is a silent wrong answer.</li>
+  </ul>
+</div>
+
+<script>
+"use strict";
+const TILE = 6, R = 2, SIDE = TILE + 2*R;          // 10
+const W = 26, H = 17;
+const NT = TILE*TILE, SLOTS = SIDE*SIDE;           // 36 threads, 100 slots
+const PASSES = Math.ceil(SLOTS/NT);                // 3
+const BX = Math.ceil(W/TILE), BY = Math.ceil(H/TILE); // 5 x 3 blocks
+const CELL = 17, TCELL = 36, OFF = 20;             // px sizes, label offset
+
+const passFill = ["#d6e6ff", "#d6f3df", "#ffe7c2"];
+let sel = null;              // {bx, by} selected block
+let passesDone = 0;
+let hover = null;            // {ty,tx} compute-window hover, tile coords of inner cell
+const imgSvg = document.getElementById("imgSvg");
+const tileSvg = document.getElementById("tileSvg");
+const chip = document.getElementById("chip");
+const stepBtn = document.getElementById("stepBtn");
+const bugChk = document.getElementById("bugChk");
+
+function narrate(html) { document.getElementById("narration").innerHTML = html; }
+function tileOrigin() { return { row0: sel.by*TILE - R, col0: sel.bx*TILE - R }; }
+function inImage(gy, gx) { return gy >= 0 && gy < H && gx >= 0 && gx < W; }
+function loadedCount() { return Math.min(passesDone*NT, SLOTS); }
+
+function renderImage() {
+  const w = BX*TILE*CELL, h = BY*TILE*CELL;
+  imgSvg.setAttribute("width", w + OFF + 2); imgSvg.setAttribute("height", h + OFF + 2);
+  let s = "";
+  // column / row index labels every 2 cells
+  for (let x = 0; x < BX*TILE; x += 2)
+    s += `<text x="${OFF + x*CELL + CELL/2}" y="${OFF-6}" font-size="9" fill="#888" text-anchor="middle">${x}</text>`;
+  for (let y = 0; y < BY*TILE; y += 2)
+    s += `<text x="${OFF-4}" y="${OFF + y*CELL + CELL/2 + 3}" font-size="9" fill="#888" text-anchor="end">${y}</text>`;
+  const o = sel ? tileOrigin() : null;
+  for (let gy = 0; gy < BY*TILE; gy++) {
+    for (let gx = 0; gx < BX*TILE; gx++) {
+      const inside = inImage(gy, gx);
+      let fill = inside ? "#fdfdfe" : "#eceef2";
+      if (sel) {
+        const inNeed = gy >= o.row0 && gy < o.row0 + SIDE && gx >= o.col0 && gx < o.col0 + SIDE;
+        const inOut  = gy >= sel.by*TILE && gy < (sel.by+1)*TILE && gx >= sel.bx*TILE && gx < (sel.bx+1)*TILE;
+        if (inNeed) {
+          if (!inside) fill = "#f8d7da";
+          else fill = inOut ? "#d6e6ff" : "#ffe7c2";
+        }
+      }
+      s += `<rect x="${OFF + gx*CELL}" y="${OFF + gy*CELL}" width="${CELL}" height="${CELL}" fill="${fill}" stroke="#e3e6ec"/>`;
+    }
+  }
+  // block grid lines
+  for (let bx = 0; bx <= BX; bx++)
+    s += `<line x1="${OFF + bx*TILE*CELL}" y1="${OFF}" x2="${OFF + bx*TILE*CELL}" y2="${OFF + h}" stroke="#9aa3b2" stroke-width="1.6"/>`;
+  for (let by = 0; by <= BY; by++)
+    s += `<line x1="${OFF}" y1="${OFF + by*TILE*CELL}" x2="${OFF + w}" y2="${OFF + by*TILE*CELL}" stroke="#9aa3b2" stroke-width="1.6"/>`;
+  // image boundary in red-ish to mark true H x W edge
+  s += `<rect x="${OFF}" y="${OFF}" width="${W*CELL}" height="${H*CELL}" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="5 3"/>`;
+  // hovered thread's output pixel
+  if (sel && hover) {
+    const gy = sel.by*TILE + hover.ty, gx = sel.bx*TILE + hover.tx;
+    s += `<rect x="${OFF + gx*CELL}" y="${OFF + gy*CELL}" width="${CELL}" height="${CELL}" fill="none" stroke="#2b6fdb" stroke-width="2.6"/>`;
+  }
+  imgSvg.innerHTML = s;
+}
+
+function renderTile() {
+  const wh = SIDE*TCELL;
+  tileSvg.setAttribute("width", wh + OFF + 2); tileSvg.setAttribute("height", wh + OFF + 2);
+  let s = "";
+  for (let c = 0; c < SIDE; c++)
+    s += `<text x="${OFF + c*TCELL + TCELL/2}" y="${OFF-6}" font-size="9" fill="#888" text-anchor="middle">${c}</text>`;
+  for (let r = 0; r < SIDE; r++)
+    s += `<text x="${OFF-4}" y="${OFF + r*TCELL + TCELL/2 + 3}" font-size="9" fill="#888" text-anchor="end">${r}</text>`;
+  const n = loadedCount();
+  const o = sel ? tileOrigin() : null;
+  for (let slot = 0; slot < SLOTS; slot++) {
+    const tr = Math.floor(slot/SIDE), tc = slot % SIDE;
+    const x = OFF + tc*TCELL, y = OFF + tr*TCELL;
+    if (!sel || slot >= n) {
+      s += `<rect x="${x}" y="${y}" width="${TCELL}" height="${TCELL}" fill="#fff" stroke="#c8cdd6" stroke-dasharray="3 3"/>`;
+      continue;
+    }
+    const pass = Math.floor(slot/NT), t = slot - pass*NT;
+    const gy = o.row0 + tr, gx = o.col0 + tc;
+    const zero = !inImage(gy, gx);
+    const fill = zero ? "#f8d7da" : passFill[pass];
+    s += `<rect x="${x}" y="${y}" width="${TCELL}" height="${TCELL}" fill="${fill}" stroke="#d8dce3"/>`;
+    s += `<text x="${x + TCELL/2}" y="${y + TCELL/2 - 2}" font-size="10.5" font-family="Consolas,monospace" fill="${zero ? "#a33" : "#334"}" text-anchor="middle">t${t}</text>`;
+    s += `<text x="${x + TCELL/2}" y="${y + TCELL/2 + 11}" font-size="9" font-family="Consolas,monospace" fill="${zero ? "#c0392b" : "#8a93a3"}" text-anchor="middle">${zero ? "0.0" : "(" + gy + "," + gx + ")"}</text>`;
+  }
+  // inner output region outline
+  s += `<rect x="${OFF + R*TCELL}" y="${OFF + R*TCELL}" width="${TILE*TCELL}" height="${TILE*TCELL}" fill="none" stroke="#2b6fdb" stroke-width="1.8" stroke-dasharray="6 4"/>`;
+  // compute-window highlight
+  if (sel && hover && passesDone >= PASSES) {
+    const { ty, tx } = hover;
+    if (!bugChk.checked) {
+      s += `<rect x="${OFF + tx*TCELL}" y="${OFF + ty*TCELL}" width="${(2*R+1)*TCELL}" height="${(2*R+1)*TCELL}" fill="none" stroke="#1b4f9b" stroke-width="2.6"/>`;
+    } else {
+      // what stride-TILE addressing actually touches, cell by cell
+      for (let dy = 0; dy <= 2*R; dy++) for (let dx = 0; dx <= 2*R; dx++) {
+        const flat = (ty + dy)*TILE + (tx + dx);      // WRONG stride
+        const br = Math.floor(flat/SIDE), bc = flat % SIDE;
+        s += `<rect x="${OFF + bc*TCELL + 3}" y="${OFF + br*TCELL + 3}" width="${TCELL-6}" height="${TCELL-6}" fill="none" stroke="#c0392b" stroke-width="2.2"/>`;
+      }
+    }
+    // center cell marker
+    s += `<circle cx="${OFF + (tx+R)*TCELL + TCELL/2}" cy="${OFF + (ty+R)*TCELL + TCELL/2}" r="4.5" fill="#2b6fdb"/>`;
+  }
+  tileSvg.innerHTML = s;
+}
+
+function updateChip() {
+  if (!sel) { chip.textContent = "select a block, then load"; chip.className = "phasechip"; return; }
+  if (passesDone < PASSES) {
+    chip.textContent = `block (${sel.by},${sel.bx}) — ${passesDone}/${PASSES} passes, ${loadedCount()}/${SLOTS} slots`;
+    chip.className = "phasechip load";
+  } else {
+    chip.textContent = `block (${sel.by},${sel.bx}) — loaded, __syncthreads() passed`;
+    chip.className = "phasechip done";
+  }
+  stepBtn.disabled = passesDone >= PASSES;
+  stepBtn.textContent = passesDone >= PASSES ? "loaded — hover the tile" : `Load pass ${passesDone+1} of ${PASSES}`;
+}
+
+function selectBlock(bx, by) {
+  sel = { bx, by }; passesDone = 0; hover = null;
+  const o = tileOrigin();
+  const zeros = (() => { let z = 0;
+    for (let s = 0; s < SLOTS; s++)
+      if (!inImage(o.row0 + Math.floor(s/SIDE), o.col0 + s % SIDE)) z++;
+    return z; })();
+  const partial = (bx === BX-1 || by === BY-1);
+  narrate(`<b>Block (${by},${bx})</b> computes output pixels rows ${by*TILE}..${Math.min((by+1)*TILE, H)-1},
+    cols ${bx*TILE}..${Math.min((bx+1)*TILE, W)-1}. It needs input rows ${o.row0}..${o.row0+SIDE-1},
+    cols ${o.col0}..${o.col0+SIDE-1}: its own 6&times;6 outputs <b>plus a width-2 halo ring</b> shared with
+    neighbouring blocks. <code>${zeros}</code> of the 100 needed cells fall outside the image &mdash; they
+    will be stored as <code>0.0f</code> at load time, so the compute loop needs no bounds checks.`
+    + (partial ? ` <span class="warn">Partial block:</span> some threads own no output pixel — they still
+    load and still hit the barrier; only their final write is skipped.` : ""));
+  updateChip(); renderImage(); renderTile();
+}
+
+stepBtn.addEventListener("click", () => {
+  if (!sel || passesDone >= PASSES) return;
+  passesDone++;
+  const p = passesDone - 1;
+  const exT = 7, exS = p*NT + exT;             // follow thread 7 as the worked example
+  if (exS < SLOTS && sel) {
+    const o = tileOrigin();
+    const tr = Math.floor(exS/SIDE), tc = exS % SIDE;
+    const gy = o.row0 + tr, gx = o.col0 + tc;
+    const active = Math.min(NT, SLOTS - p*NT);
+    narrate(`<b>Pass ${passesDone}:</b> thread <code>t</code> fills slot <code>s = t + ${p}&middot;36</code>.
+      Example — thread 7 fills slot ${exS}: tile row <code>${exS}/10 = ${tr}</code>, col <code>${exS}%10 = ${tc}</code>
+      &rarr; global pixel (${gy}, ${gx}) ${inImage(gy,gx) ? "&rarr; a real load, coalesced with its neighbours"
+      : '&rarr; <span class="warn">outside the image &rarr; store 0.0f</span>'}.
+      ${active < NT ? `Only threads 0..${active-1} have a slot left; threads ${active}..35 do nothing this pass.` : ""}
+      ${passesDone === PASSES ? `<br><b>All 100 slots written &rarr; __syncthreads().</b> Every thread waits here —
+      slot values written by one thread are about to be read by many others. Now hover the inner 6&times;6.` : ""}`);
+  }
+  updateChip(); renderTile();
+});
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  passesDone = 0; hover = null; updateChip(); renderImage(); renderTile();
+  if (sel) narrate(`Loads cleared for block (${sel.by},${sel.bx}). Step the passes again, or pick another block.`);
+});
+bugChk.addEventListener("change", () => { renderTile(); });
+
+imgSvg.addEventListener("click", (e) => {
+  const r = imgSvg.getBoundingClientRect();
+  const gx = Math.floor((e.clientX - r.left - OFF)/CELL), gy = Math.floor((e.clientY - r.top - OFF)/CELL);
+  if (gx < 0 || gy < 0 || gx >= BX*TILE || gy >= BY*TILE) return;
+  selectBlock(Math.floor(gx/TILE), Math.floor(gy/TILE));
+});
+
+tileSvg.addEventListener("mousemove", (e) => {
+  if (!sel || passesDone < PASSES) return;
+  const rct = tileSvg.getBoundingClientRect();
+  const c = Math.floor((e.clientX - rct.left - OFF)/TCELL), r = Math.floor((e.clientY - rct.top - OFF)/TCELL);
+  const ty = r - R, tx = c - R;
+  if (ty < 0 || tx < 0 || ty >= TILE || tx >= TILE) { if (hover) { hover = null; renderImage(); renderTile(); } return; }
+  if (hover && hover.ty === ty && hover.tx === tx) return;
+  hover = { ty, tx };
+  const gy = sel.by*TILE + ty, gx = sel.bx*TILE + tx;
+  const owns = inImage(gy, gx);
+  narrate(`<b>Thread (ty,tx) = (${ty},${tx})</b> &rarr; output pixel (${gy}, ${gx})${owns ? "" :
+      ' — <span class="warn">outside the image: computes but skips its write</span>'}.
+    Its 5&times;5 window is tile rows ${ty}..${ty+2*R}, cols ${tx}..${tx+2*R} — the top-left corner IS (ty,tx),
+    the centre is (ty+2, tx+2) = (${ty+R},${tx+R}).
+    Address: <code>tile[(ty+dy)*10 + (tx+dx)]</code> — <b>stride 10 (the tile side), not 6</b>.`
+    + (bugChk.checked ? ` <span class="warn">Bug mode: red cells are what stride-6 addressing actually reads —
+      rows collapse on top of each other and wrap.</span>` : ""));
+  renderImage(); renderTile();
+});
+tileSvg.addEventListener("mouseleave", () => { if (hover) { hover = null; renderImage(); renderTile(); } });
+
+selectBlock(1, 1);   // start on an interior block
+narrate(`Starting on interior <b>block (1,1)</b>. Step the load passes, then try a corner block —
+  block (0,0) shows the zero padding, the bottom-right block shows partial-tile behaviour.`);
+</script>
+</body>
+</html>
