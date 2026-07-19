@@ -216,8 +216,8 @@ Instead the hardware runs one side of the branch with the disagreeing lanes swit
 other side with the roles reversed. This is called <b>divergence</b>, and its cost is the sum of both
 paths. Often, though, the compiler avoids branching entirely using <b>predication</b>: every lane
 executes the instruction, and a small per-lane flag decides whether the result is kept or thrown
-away. We will meet predication properly in chapter 11, where it overturns the usual intuition about
-what an <code>if</code> costs.</p>
+away. Sections 2.4 through 2.7 open this machinery up in detail — predication in particular
+overturns the usual intuition about what an <code>if</code> costs.</p>
 <p>The second concerns <b>memory</b>. Because a warp issues its 32 loads together, the hardware has
 the opportunity to merge them into just a few memory transactions — but only if the addresses
 cooperate. This is called <b>coalescing</b> and is the subject of the next chapter.</p>
@@ -235,6 +235,332 @@ SM — its <b>occupancy</b>, out of a maximum of 64 on this card — is therefor
 right. Anything that reduces it, such as a block asking for a large slice of shared memory or using
 many registers per thread, shrinks the SM's supply of "other work" and leaves memory delays exposed.
 Chapter 8 measures exactly this effect going wrong.</p>
+
+<h2>2.4 Inside the SM: four small machines</h2>
+<p>To understand what the SM actually does with its warps, we need to open it up. An SM's 128
+arithmetic cores are not one undifferentiated pool. They are organized into <b>four partitions</b>
+of 32 cores each, and at the front of every partition sits a small unit called a <b>warp
+scheduler</b>. When blocks are placed on the SM, their warps are divided among the four schedulers —
+with the SM fully loaded, each scheduler owns sixteen of the 64 resident warps — and each warp
+belongs to its scheduler for life.</p>
+<p>Notice how deliberately the widths line up: one scheduler issues one instruction for one warp of
+32 lanes, and its partition contains exactly 32 cores to carry that instruction out. A partition is,
+in effect, "everything one warp-instruction needs for one cycle." The SM is best pictured not as one
+big processor but as four small ones side by side, each juggling its own sixteen warps.</p>
+
+<div class="fig">
+<svg width="640" height="200" viewBox="0 0 640 200" font-family="Segoe UI, sans-serif">
+  <rect x="20" y="26" width="600" height="160" fill="#f7f8fa" stroke="#c3c2b7" rx="8"/>
+  <text x="320" y="18" text-anchor="middle" font-size="11" font-weight="600">one SM (this card has 10)</text>
+  <g font-size="8.5">
+    <g>
+      <rect x="40" y="44" width="130" height="130" fill="#fff" stroke="#2a78d6" rx="6"/>
+      <rect x="50" y="54" width="110" height="24" fill="#2a78d6" rx="3"/>
+      <text x="105" y="70" text-anchor="middle" fill="#fff">warp scheduler 0</text>
+      <rect x="50" y="86" width="110" height="22" fill="#d6e6ff" rx="3"/>
+      <text x="105" y="101" text-anchor="middle">16 resident warps</text>
+      <path d="M105 112 L105 122" stroke="#898781" stroke-width="1.5" marker-end="url(#arrS)"/>
+      <rect x="50" y="126" width="110" height="34" fill="#86b6ef" rx="3"/>
+      <text x="105" y="147" text-anchor="middle">32 cores</text>
+    </g>
+    <g>
+      <rect x="185" y="44" width="130" height="130" fill="#fff" stroke="#2a78d6" rx="6"/>
+      <rect x="195" y="54" width="110" height="24" fill="#2a78d6" rx="3"/>
+      <text x="250" y="70" text-anchor="middle" fill="#fff">warp scheduler 1</text>
+      <rect x="195" y="86" width="110" height="22" fill="#d6e6ff" rx="3"/>
+      <text x="250" y="101" text-anchor="middle">16 resident warps</text>
+      <path d="M250 112 L250 122" stroke="#898781" stroke-width="1.5" marker-end="url(#arrS)"/>
+      <rect x="195" y="126" width="110" height="34" fill="#86b6ef" rx="3"/>
+      <text x="250" y="147" text-anchor="middle">32 cores</text>
+    </g>
+    <g>
+      <rect x="330" y="44" width="130" height="130" fill="#fff" stroke="#2a78d6" rx="6"/>
+      <rect x="340" y="54" width="110" height="24" fill="#2a78d6" rx="3"/>
+      <text x="395" y="70" text-anchor="middle" fill="#fff">warp scheduler 2</text>
+      <rect x="340" y="86" width="110" height="22" fill="#d6e6ff" rx="3"/>
+      <text x="395" y="101" text-anchor="middle">16 resident warps</text>
+      <path d="M395 112 L395 122" stroke="#898781" stroke-width="1.5" marker-end="url(#arrS)"/>
+      <rect x="340" y="126" width="110" height="34" fill="#86b6ef" rx="3"/>
+      <text x="395" y="147" text-anchor="middle">32 cores</text>
+    </g>
+    <g>
+      <rect x="475" y="44" width="130" height="130" fill="#fff" stroke="#2a78d6" rx="6"/>
+      <rect x="485" y="54" width="110" height="24" fill="#2a78d6" rx="3"/>
+      <text x="540" y="70" text-anchor="middle" fill="#fff">warp scheduler 3</text>
+      <rect x="485" y="86" width="110" height="22" fill="#d6e6ff" rx="3"/>
+      <text x="540" y="101" text-anchor="middle">16 resident warps</text>
+      <path d="M540 112 L540 122" stroke="#898781" stroke-width="1.5" marker-end="url(#arrS)"/>
+      <rect x="485" y="126" width="110" height="34" fill="#86b6ef" rx="3"/>
+      <text x="540" y="147" text-anchor="middle">32 cores</text>
+    </g>
+  </g>
+  <defs><marker id="arrS" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#898781"/></marker></defs>
+</svg>
+<div class="cap"><b>Figure 2.2</b> — Inside one SM: four partitions, each with its own scheduler, its
+own sixteen warps, and its own 32 cores. Every warp's registers live permanently in the partition's
+register file for as long as the warp is resident — which is why, as &sect;2.6 explains, switching
+between warps moves no data and costs no time.</div>
+</div>
+
+<h2>2.5 Issuing: the SM's serial currency</h2>
+<p>All the work an SM ever does begins the same way. On each clock cycle, each scheduler picks one
+warp — from its own sixteen — whose next instruction is able to start, and starts it: hands it to
+the arithmetic units, or the memory units, whichever the instruction needs. That act of starting an
+instruction is called <b>issuing</b> it, and each scheduler can issue for only about one warp per
+cycle. The execution units downstream are wide and run in parallel, but nothing reaches them except
+through a scheduler, one instruction at a time. A helpful picture is a ticket window: every
+instruction a warp will ever execute must pass through the window, the window serves one instruction
+per cycle, and the queue behind it never gets to skip a turn.</p>
+<p>Those per-cycle opportunities are called <b>issue slots</b>, and they are the SM's serial
+currency — the thing every instruction must spend exactly one of. That makes the card's total issue
+capacity a simple multiplication. Each scheduler starts one warp-instruction per cycle, which does
+the work of 32 threads; four schedulers per SM makes 128 thread-instructions per cycle; ten SMs at
+roughly 1.4 GHz gives about <b>1.8 trillion thread-instructions per second</b> for the whole card.
+And that number puts a hard floor under every kernel's runtime, independent of anything memory
+does:</p>
+<p style="text-align:center"><i>minimum time &nbsp;&ge;&nbsp; total thread-instructions &nbsp;&divide;&nbsp; 1.8 trillion per second</i></p>
+<p>This floor is not a curiosity — it decided a real optimization. In chapter 11, the first 2D
+convolution kernel spends about ten instructions per tap, of which only one is the multiply-add
+doing mathematics. Multiply it out: 16.7 million pixels &times; 81 taps &times; 10 instructions is
+about 13.6 billion instructions, and dividing by the issue capacity gives 7.5 milliseconds —
+a floor the kernel could not go below <i>even if memory were infinitely fast</i>. The kernel
+measured 10.6 ms, so it was pressed against this wall, not the memory wall, and the optimizations
+that followed were all one campaign: make the program shorter, so fewer trips through the ticket
+window are needed. (A footnote for completeness: schedulers can occasionally start two instructions
+from the same warp in one cycle when the pair needs different execution units — so the true capacity
+is slightly higher — and an issued instruction then takes further cycles to <i>complete</i> its
+journey through the units. Neither detail changes the picture: issue slots are scarce and serial,
+and every instruction costs one.)</p>
+
+<h2>2.6 A cycle in the life of a scheduler</h2>
+<p>Now let us watch the scheduler make its choices, because the mechanism is the whole secret of
+GPU latency hiding. Each warp carries its own <b>program counter</b> — a marker pointing at the
+next instruction it has not yet started — and its own registers, held permanently in the
+partition's register file. Every cycle, the scheduler asks one question: <i>which of my sixteen
+warps has a next instruction that can start right now?</i> An instruction can start when the values
+it needs exist — nothing it depends on is still in flight — and the unit it needs has room. A warp
+that fails this test is <b>stalled</b>: not paused mid-action, simply ineligible this cycle.</p>
+<p>Follow a concrete story, drawn in Figure 2.3. Warp 1's first five instructions are each ready
+when their turn comes, so the scheduler issues them on five consecutive cycles. Instruction 5 is a
+load from DRAM, and instruction 6 needs the loaded value — which will not arrive for some 400
+cycles. Warp 1 is now stalled. The scheduler does not wait with it: on the very next cycle it finds
+another eligible warp — warp 2, say, which had been stalled and whose awaited value arrived a moment
+ago — and issues warp 2's next instruction, from exactly where warp 2's program counter points.
+Nothing is skipped and nothing repeated; stalling never loses a warp's place, because the program
+counter <i>is</i> the place. For the next four hundred cycles the scheduler weaves among its other
+warps, and warp 1's enormous memory delay disappears behind their work. When the value finally
+lands, warp 1 becomes eligible again, and some cycle soon after, instruction 6 issues as if nothing
+had happened.</p>
+
+<div class="fig">
+<svg width="660" height="190" viewBox="0 0 660 190" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <g>
+      <rect x="30" y="14" width="12" height="12" fill="#2a78d6" rx="2"/><text x="47" y="24">warp 1</text>
+      <rect x="95" y="14" width="12" height="12" fill="#1baf7a" rx="2"/><text x="112" y="24">warp 2</text>
+      <rect x="160" y="14" width="12" height="12" fill="#eda100" rx="2"/><text x="177" y="24">warp 3</text>
+      <text x="640" y="24" text-anchor="end" fill="#52514e">one cell = one issue slot of this scheduler</text>
+    </g>
+    <g font-size="8" fill="#898781">
+      <text x="53" y="52" text-anchor="middle">cycle 1</text><text x="103" y="52" text-anchor="middle">2</text>
+      <text x="153" y="52" text-anchor="middle">3</text><text x="203" y="52" text-anchor="middle">4</text>
+      <text x="253" y="52" text-anchor="middle">5</text><text x="303" y="52" text-anchor="middle">6</text>
+      <text x="353" y="52" text-anchor="middle">7</text><text x="403" y="52" text-anchor="middle">8</text>
+      <text x="453" y="52" text-anchor="middle">9</text><text x="503" y="52" text-anchor="middle">10</text>
+      <text x="593" y="52" text-anchor="middle">~cycle 420</text>
+    </g>
+    <g font-size="8.2">
+      <rect x="30" y="58" width="46" height="30" fill="#2a78d6" rx="3"/><text x="53" y="77" text-anchor="middle" fill="#fff">W1 · I1</text>
+      <rect x="80" y="58" width="46" height="30" fill="#2a78d6" rx="3"/><text x="103" y="77" text-anchor="middle" fill="#fff">W1 · I2</text>
+      <rect x="130" y="58" width="46" height="30" fill="#2a78d6" rx="3"/><text x="153" y="77" text-anchor="middle" fill="#fff">W1 · I3</text>
+      <rect x="180" y="58" width="46" height="30" fill="#2a78d6" rx="3"/><text x="203" y="77" text-anchor="middle" fill="#fff">W1 · I4</text>
+      <rect x="230" y="58" width="46" height="30" fill="#2a78d6" rx="3"/><text x="253" y="77" text-anchor="middle" fill="#fff">W1 · I5</text>
+      <rect x="280" y="58" width="46" height="30" fill="#1baf7a" rx="3"/><text x="303" y="77" text-anchor="middle" fill="#fff">W2 · I7</text>
+      <rect x="330" y="58" width="46" height="30" fill="#eda100" rx="3"/><text x="353" y="77" text-anchor="middle">W3 · I1</text>
+      <rect x="380" y="58" width="46" height="30" fill="#1baf7a" rx="3"/><text x="403" y="77" text-anchor="middle" fill="#fff">W2 · I8</text>
+      <rect x="430" y="58" width="46" height="30" fill="#eda100" rx="3"/><text x="453" y="77" text-anchor="middle">W3 · I2</text>
+      <rect x="480" y="58" width="46" height="30" fill="#1baf7a" rx="3"/><text x="503" y="77" text-anchor="middle" fill="#fff">W2 · I9</text>
+      <text x="545" y="77" text-anchor="middle" fill="#898781">…</text>
+      <rect x="570" y="58" width="46" height="30" fill="#2a78d6" rx="3"/><text x="593" y="77" text-anchor="middle" fill="#fff">W1 · I6</text>
+    </g>
+    <path d="M253 96 C 300 130, 520 130, 590 96" stroke="#2a78d6" stroke-width="1.3" fill="none" stroke-dasharray="4 3"/>
+    <text x="420" y="132" text-anchor="middle" fill="#1c5cab">I5's load is in flight for ~400 cycles — warp 1 is stalled, but the scheduler never waits:</text>
+    <text x="420" y="146" text-anchor="middle" fill="#1c5cab">every one of those cycles issues some other warp's ready instruction</text>
+    <text x="420" y="172" text-anchor="middle" fill="#52514e">the delay is invisible — as long as the answer to "is anyone ready?" is never no</text>
+  </g>
+</svg>
+<div class="cap"><b>Figure 2.3</b> — One scheduler's issue slots over time. Warp 1 issues five
+instructions, then stalls on a memory load; the scheduler immediately interleaves warps 2 and 3, each
+resuming from its own program counter, and warp 1's instruction 6 issues hundreds of cycles later
+when the loaded value arrives. Occupancy is what keeps this weave possible: the more resident warps,
+the rarer the cycle where nobody is ready and the slot is wasted.</div>
+</div>
+
+<p>Two properties of this dance are easy to miss and worth stating plainly.</p>
+<p>First, <b>switching warps costs nothing</b> — and this is the deep difference from a CPU. When a
+CPU switches threads it must save one thread's registers and load another's, a matter of thousands
+of cycles, so it switches rarely and reluctantly. On the GPU, all sixteen warps' registers sit
+permanently side by side in the partition's register file, and every warp keeps its own program
+counter. "Switching" from warp 1 to warp 2 is nothing more than the scheduler selecting a different
+warp number this cycle. No state moves anywhere. That is why the scheduler can alternate between
+warps on back-to-back cycles, at a granularity no operating system could dream of.</p>
+<p>Second, <b>the choosing itself consumes no cycles</b>. It is natural to imagine the scheduler
+pausing to scan its sixteen warps — but that intuition comes from software, where scheduling is a
+program that takes time. Here scheduling is <i>wiring</i>. A piece of bookkeeping hardware
+(traditionally called a <b>scoreboard</b>) maintains a running ready-or-not flag for every warp,
+updated by events as they happen: when warp 1 issues its load, warp 1's flag drops; four hundred
+cycles later, the arriving data itself flips the flag back. Nothing ever has to go looking. And
+picking one warp from sixteen ready-flags is a small combinational circuit that settles within a
+fraction of the cycle, concurrently with the current instruction being dispatched — the ticket
+window does not close while deciding whom to serve next. The scheduler's cost is paid in silicon
+and power, not in time. This is also why real scheduling policies are simple (issue from the same
+warp until it stalls, then move to the oldest ready one): a cleverer policy would be a bigger,
+slower circuit, and a 0.7-nanosecond cycle will not wait for it.</p>
+<p>The one thing that <i>can</i> go wrong is an empty queue. If all sixteen flags say "not ready" —
+typically because too few warps are resident and they all hit their memory stalls together — the
+cycle's issue slot is simply lost. This is occupancy's whole story told from the scheduler's chair,
+and it is exactly what the GEMV experiment of chapter 8 measures: shared memory demands cut
+occupancy to 37.5%, each scheduler was left juggling about six warps instead of sixteen, the
+"is anyone ready?" question started coming up empty, and the kernel slowed down even though no
+single instruction got slower.</p>
+
+<h2>2.7 What an <code>if</code> really costs: divergence and predication</h2>
+<p>Section 2.2 introduced the two ways a warp copes with an <code>if</code> — divergence and
+predication — in a sentence each. Now that we know what issue slots are, we can do the accounting
+properly, because the two mechanisms are best understood as two ways of paying the same bill.</p>
+<p>Start from the constraint that creates the bill. A warp has one instruction stream. Whatever its
+32 lanes need done, all of it must pass through that single stream — so if lane 3 needs path A and
+lane 7 needs path B, the stream must contain <i>the union of both paths</i>, and each lane sits idle
+through the part that is not its own. That is the essence of divergence, and notice that it is a
+statement about lanes disagreeing, not about branches. No encoding can make disagreement free; the
+union is the union. Branching and predication are just two layouts for it:</p>
+<p>A <b>branch</b> jumps over work no active lane needs. When the warp is unanimous, it executes
+only the side it took. When lanes disagree, the hardware runs each side in turn with the other
+side's lanes masked off, then reconverges.</p>
+<p><b>Predication</b> never jumps. Both sides sit in the stream unconditionally; the compare writes
+a per-lane true/false flag, and every following instruction carries the flag, taking effect only in
+lanes where it says yes. In the compiled 2D convolution this looks like
+<code>@!P3 LDG&nbsp;…</code> followed by <code>@!P3 FFMA&nbsp;…</code> — load and multiply-add that
+happen, per lane, only where flag P3 permits.</p>
+<p>To reason about predication precisely, separate two questions that sound alike. <i>Does the warp
+spend time on a predicated instruction?</i> Always — it is next in the stream, so it consumes an
+issue slot (&sect;2.5) whether the flags enable 32 lanes or none. The scheduler cannot peek at flags
+and skip ahead; deciding to skip <i>is</i> branching, the very thing predication exists to avoid.
+<i>Does the instruction take effect in a given lane?</i> Only if that lane's flag says so. A masked
+lane's destination register is untouched, and — crucially — a masked lane's <b>memory access never
+happens</b>: a predicated-off load sends no request to the memory system at all. This is a
+correctness guarantee, not just a performance fact. In chapter 11's kernel D, edge threads compute
+addresses that point <i>outside the image</i> before the bounds check decides anything; the reason
+that is safe is that the masked load never touches memory, so the bad address is only ever
+arithmetic in a register. In short: <b>predication always spends the warp's time, but only
+conditionally spends each lane's effects.</b></p>
+
+<div class="fig">
+<svg width="640" height="250" viewBox="0 0 640 250" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <text x="160" y="18" text-anchor="middle" font-size="10" font-weight="600">the stream under predication</text>
+    <text x="253" y="34" font-size="8" fill="#898781">lanes: x&gt;0 ✓✓✓✓✓ ✗✗✗</text>
+    <g>
+      <rect x="30" y="40" width="160" height="22" fill="#eef1f6" stroke="#c3c2b7" rx="3"/>
+      <text x="110" y="55" text-anchor="middle">CMP → per-lane flag P</text>
+      <rect x="30" y="66" width="160" height="22" fill="#d6e6ff" stroke="#2a78d6" rx="3"/>
+      <text x="110" y="81" text-anchor="middle">@P  A1</text>
+      <rect x="30" y="92" width="160" height="22" fill="#d6e6ff" stroke="#2a78d6" rx="3"/>
+      <text x="110" y="107" text-anchor="middle">@P  A2</text>
+      <rect x="30" y="118" width="160" height="22" fill="#ffe7c2" stroke="#eda100" rx="3"/>
+      <text x="110" y="133" text-anchor="middle">@!P  B1</text>
+      <rect x="30" y="144" width="160" height="22" fill="#ffe7c2" stroke="#eda100" rx="3"/>
+      <text x="110" y="159" text-anchor="middle">@!P  B2</text>
+      <rect x="30" y="170" width="160" height="22" fill="#ffe7c2" stroke="#eda100" rx="3"/>
+      <text x="110" y="185" text-anchor="middle">@!P  B3</text>
+      <rect x="30" y="196" width="160" height="22" fill="#ffe7c2" stroke="#eda100" rx="3"/>
+      <text x="110" y="211" text-anchor="middle">@!P  B4</text>
+    </g>
+    <g>
+      <g transform="translate(210,44)">
+        <g fill="#52514e"><rect width="10" height="10" x="0" fill="#898781" rx="2"/><rect width="10" height="10" x="13" fill="#898781" rx="2"/><rect width="10" height="10" x="26" fill="#898781" rx="2"/><rect width="10" height="10" x="39" fill="#898781" rx="2"/><rect width="10" height="10" x="52" fill="#898781" rx="2"/><rect width="10" height="10" x="65" fill="#898781" rx="2"/><rect width="10" height="10" x="78" fill="#898781" rx="2"/><rect width="10" height="10" x="91" fill="#898781" rx="2"/></g>
+      </g>
+      <g transform="translate(210,70)">
+        <rect width="10" height="10" x="0" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="13" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="26" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="39" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="52" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="65" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="78" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="91" fill="none" stroke="#c3c2b7" rx="2"/>
+      </g>
+      <g transform="translate(210,96)">
+        <rect width="10" height="10" x="0" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="13" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="26" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="39" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="52" fill="#2a78d6" rx="2"/><rect width="10" height="10" x="65" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="78" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="91" fill="none" stroke="#c3c2b7" rx="2"/>
+      </g>
+      <g transform="translate(210,122)">
+        <rect width="10" height="10" x="0" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="13" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="26" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="39" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="52" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="65" fill="#eda100" rx="2"/><rect width="10" height="10" x="78" fill="#eda100" rx="2"/><rect width="10" height="10" x="91" fill="#eda100" rx="2"/>
+      </g>
+      <g transform="translate(210,148)">
+        <rect width="10" height="10" x="0" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="13" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="26" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="39" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="52" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="65" fill="#eda100" rx="2"/><rect width="10" height="10" x="78" fill="#eda100" rx="2"/><rect width="10" height="10" x="91" fill="#eda100" rx="2"/>
+      </g>
+      <g transform="translate(210,174)">
+        <rect width="10" height="10" x="0" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="13" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="26" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="39" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="52" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="65" fill="#eda100" rx="2"/><rect width="10" height="10" x="78" fill="#eda100" rx="2"/><rect width="10" height="10" x="91" fill="#eda100" rx="2"/>
+      </g>
+      <g transform="translate(210,200)">
+        <rect width="10" height="10" x="0" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="13" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="26" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="39" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="52" fill="none" stroke="#c3c2b7" rx="2"/><rect width="10" height="10" x="65" fill="#eda100" rx="2"/><rect width="10" height="10" x="78" fill="#eda100" rx="2"/><rect width="10" height="10" x="91" fill="#eda100" rx="2"/>
+      </g>
+    </g>
+    <text x="160" y="236" text-anchor="middle" fill="#52514e">every row costs an issue slot; filled = lane takes effect, hollow = lane no-op</text>
+
+    <text x="490" y="18" text-anchor="middle" font-size="10" font-weight="600">issue slots consumed per warp</text>
+    <g>
+      <text x="360" y="66" font-size="8.5">predication, ANY warp</text>
+      <rect x="360" y="72" width="196" height="16" fill="#2a78d6" rx="3"/>
+      <text x="562" y="84" font-size="8.5">7</text>
+      <text x="360" y="116" font-size="8.5">branch, unanimous warp (all took A)</text>
+      <rect x="360" y="122" width="112" height="16" fill="#86b6ef" rx="3"/>
+      <text x="478" y="134" font-size="8.5">4</text>
+      <text x="360" y="166" font-size="8.5">branch, mixed warp (both sides run)</text>
+      <rect x="360" y="172" width="224" height="16" fill="#86b6ef" rx="3"/>
+      <text x="590" y="184" font-size="8.5">8</text>
+      <text x="490" y="216" text-anchor="middle" font-size="8.5" fill="#52514e">most warps are unanimous in practice —</text>
+      <text x="490" y="229" text-anchor="middle" font-size="8.5" fill="#52514e">so for fat bodies, real branches win</text>
+    </g>
+  </g>
+</svg>
+<div class="cap"><b>Figure 2.4</b> — An <code>if</code> with a 2-instruction A-side and a
+4-instruction B-side. Left: under predication the stream contains everything, every row costs an
+issue slot for every warp, and the flags only control which lanes keep results. Right: the slot
+count per warp. Predication charges the union to everyone, always; a branch charges the union only
+to warps whose lanes actually disagree. When bodies are small the difference is negligible and
+predication's simplicity wins; when a body is fat, branching wins because most warps are
+unanimous.</div>
+</div>
+
+<p>The figure's arithmetic explains when each mechanism wins, and it is exactly the trade the
+compiler weighs for every <code>if</code> it compiles. Predication is the better deal when the
+guarded work is small — a load and a multiply-add, say — because "just issue it everywhere and let
+the flags sort it out" costs less than the jumping-and-reconverging machinery. This is why the
+bounds check in the 2D convolution kernel compiled to predicated instructions, and why an edge warp
+there costs exactly as much as an interior warp. But predication charges every warp for both sides,
+forever. Give the <code>else</code> a hundred instructions, and predicated code makes the thousands
+of warps that would unanimously skip it pay for all hundred anyway — while a branch lets them leap
+over it for the price of a compare and a jump. Real kernels' warps are unanimous far more often than
+not, so for fat bodies the branch wins by a wide margin, and the compiled 2D convolution contains
+both mechanisms side by side: predication for the small guarded loads, genuine branches around the
+larger blocks. (Predication has a second, quieter cost: both sides' intermediate values must be
+computed before the flags choose, so both sides' values need registers at once — and registers, like
+occupancy, are a budget.)</p>
+<p>Finally, there is work predication cannot express at all: control flow whose <i>shape</i> depends
+on data. The canonical example is a loop whose iteration count differs per lane —
+<code>while (error &gt; tolerance)</code>, where each lane's error converges at its own pace. No
+assignment of per-instruction flags can make lane 5 run the body three times while lane 20 runs it
+nine hundred times; the number of instructions in the stream would itself have to differ per lane.
+All the machine can do is keep the whole warp looping until the slowest lane finishes, with finished
+lanes masked off and idle — divergence in its pure, irreducible form. When you meet it, the remedy
+is never an encoding trick; it is redistributing the work so the lanes of a warp want similar
+amounts, which is precisely the challenge the sparse matrix-vector kernel on the roadmap exists to
+teach.</p>
+
+<div class="keybox"><span class="kb-t">WHAT TO REMEMBER</span><br>
+The warp scheduler is the machine's beating heart: four per SM, each making a free, per-cycle choice
+among its sixteen warps, with switching costing nothing because every warp's registers and program
+counter stay put. Issue slots are the serial currency — about 1.8 trillion thread-instructions per
+second on this card — and dividing a kernel's instruction count by that capacity gives a floor no
+memory optimization can breach. Divergence's true cost is the union of the work lanes disagree
+about; predication and branching are just two ways to lay that union out, spending time
+unconditionally but effects per-lane. And some divergence — lane-varying loop counts — no mechanism
+removes; only reshaping the work does.</div>
 
 <h1><span class="chip">3</span>The memory hierarchy</h1>
 
@@ -983,7 +1309,7 @@ in-place convolution would race regardless.</p>
 all 81 taps — is branch divergence. The measured truth is more interesting. First, divergence
 requires lanes <i>of the same warp</i> to disagree, and in a 4096&sup2; image only the blocks
 touching an edge (about 1.6% of them) ever produce disagreement; for everyone else the condition is
-uniformly true. Second, the compiler did not emit a branch at all: it used predication (&sect;2.2),
+uniformly true. Second, the compiler did not emit a branch at all: it used predication (&sect;2.7),
 compiling the guarded load and multiply-add with a per-lane flag, so an edge warp and an interior
 warp execute the identical instruction sequence in identical time.</p>
 <p>So the check causes no divergence to speak of. What it does cost is <b>instructions</b>. Counting
@@ -1246,6 +1572,10 @@ median-of-samples timing.</p>
   <tr><th>Term</th><th>Meaning</th></tr>
   <tr><td>warp / lane</td><td>a group of 32 threads that execute each instruction together, in lockstep / one thread's position (0&ndash;31) within its warp</td></tr>
   <tr><td>occupancy</td><td>how many warps are resident on an SM, out of a maximum of 64 — the SM's supply of "other work" for hiding memory latency</td></tr>
+  <tr><td>warp scheduler</td><td>the unit at the front of each SM partition (four per SM) that picks one ready warp per cycle and starts its next instruction</td></tr>
+  <tr><td>issue / issue slot</td><td>starting an instruction / one scheduler's per-cycle opportunity to do so — the SM's serial currency, which every instruction costs exactly one of</td></tr>
+  <tr><td>program counter</td><td>a warp's marker for the next instruction it has not yet started; stalling never loses the place, because this is the place</td></tr>
+  <tr><td>scoreboard</td><td>the always-on bookkeeping hardware that keeps a ready-or-not flag per warp, updated by events (a load result arriving flips the flag) rather than by scanning</td></tr>
   <tr><td>coalescing</td><td>the hardware merging a warp's 32 loads into a few wide transactions, possible when consecutive lanes read consecutive addresses</td></tr>
   <tr><td>shared memory</td><td>the 96 KB scratchpad inside each SM; blocks lease private slices of it for their lifetime</td></tr>
   <tr><td>bank / bank conflict</td><td>shared memory is 32 banks, word i in bank i mod 32; two lanes needing different words of one bank serialize the access</td></tr>
