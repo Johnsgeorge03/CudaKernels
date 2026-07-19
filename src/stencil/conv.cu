@@ -193,9 +193,6 @@ __global__ void conv2dTiledKernel(const float* in, float* out,
 {
     extern __shared__ float tile[];   // (CONV2D_TILE + 2r)^2 floats
 
-    // TODO (you): flatten-and-stride load incl. halo + zero padding; barrier;
-    // accumulate over the (2r+1)^2 window from the tile; write out[y*W + x]
-    // if inside the image.
     // Load to shared memory
     int tid = threadIdx.y * CONV2D_TILE_X + threadIdx.x;
     int side_c = CONV2D_TILE_X + 2 * r;

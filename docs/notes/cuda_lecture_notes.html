@@ -96,9 +96,10 @@
   <div>10. 1D convolution — constant memory and halos</div>
   <div>11. 2D convolution — the ladder of walls</div>
   <div class="part">Part III — The playbook</div>
-  <div>12. Cross-cutting principles</div>
-  <div>13. Results and glossary</div>
-  <div>14. What comes next</div>
+  <div>12. Reading the assembly — PTX and SASS</div>
+  <div>13. Cross-cutting principles</div>
+  <div>14. Results and glossary</div>
+  <div>15. What comes next</div>
 </div>
 
 <h1><span class="chip">1</span>The card you are programming</h1>
@@ -757,7 +758,7 @@ convolution mask, so that a transposed index cannot accidentally pass.</p>
 this machine (Windows blocks its hardware counters without administrator settings), so the project
 learned to work without it: controlled parameter sweeps that decompose a kernel's time into
 physically meaningful parts (chapter 10), and reading the compiler's actual output — the GPU
-assembly — to count instructions directly (chapter 11).</p>
+assembly — to count instructions directly (chapters 11 and 12).</p>
 
 <h1><span class="chip">5</span>Matrix multiplication — reuse and tiling</h1>
 
@@ -1475,11 +1476,479 @@ is usually the condition's evaluation, not divergence, and the cure is structura
 data), not cleverer branching. Bank conflicts come in two species — strided access (pad it) and warp
 shape (reshape it). An optimization can be correct, measure zero, and still be right — if the wall
 it removes is next in line. And when the profiler is locked, <code>cuobjdump -sass</code> plus
-patient counting is a profiler nobody can block. The known headroom, for a future session: each
+patient counting is a profiler nobody can block — chapter 12 is a complete tour of exactly that
+skill. The known headroom, for a future session: each
 thread computes several neighboring outputs, whose windows overlap 8/9 — the register-tiling idea
 from matmul, returning in stencil form.</div>
 
-<h1><span class="chip">12</span>Cross-cutting principles</h1>
+<h1><span class="chip">12</span>Reading the assembly — PTX and SASS</h1>
+
+<p>Chapter 11 kept saying "reading the compiled assembly answered it" — the dead sixteen-tap fast
+path, the ten-instructions-per-tap bounds check, the mask weight riding inside the multiply-add.
+This chapter shows how that reading is actually done. It introduces the two assembly languages a
+CUDA program passes through, builds the small vocabulary needed to read them, walks one complete
+kernel line by line, and then retells the 2D convolution ladder purely in instructions, so that
+every millisecond that fell in chapter 11 can be pointed at in the listing that fell with it.
+Nothing here requires a profiler, special permissions, or even a GPU — only the compiler's output
+and patience. Every listing in this chapter is the real output of the tools on this machine's
+build, shortened but never altered.</p>
+
+<h2>12.1 One program, two assembly languages</h2>
+
+<p>When <code>nvcc</code> compiles a kernel, the translation happens in two distinct stages, and
+each stage has its own output language. The front end translates C++ into <b>PTX</b> (Parallel
+Thread Execution), which looks like assembly but is deliberately idealized: it has an unlimited
+supply of registers, refers to variables by their source names, and targets no particular chip.
+PTX is a <i>portable</i> description of the kernel — the same PTX can be turned into machine code
+for a card from 2016 or one from 2026. The second stage, a separate compiler called
+<code>ptxas</code>, takes the PTX and produces <b>SASS</b> (the GPU's native "shader assembly"),
+the actual machine code for one specific chip — in our case <code>sm_61</code>, Pascal. SASS is
+where reality lives: real registers with a hard limit of 255 per thread, real instruction
+encodings, and real scheduling decisions.</p>
+
+<div class="fig">
+<svg viewBox="0 0 680 168" xmlns="http://www.w3.org/2000/svg" style="width: 100%; max-width: 660px;">
+  <defs>
+    <marker id="arr12" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#52514e"/>
+    </marker>
+  </defs>
+  <g font-family="Segoe UI, sans-serif" font-size="12">
+    <rect x="8" y="34" width="120" height="52" rx="6" fill="#d6e6ff" stroke="#2a78d6" stroke-width="1.5"/>
+    <text x="68" y="56" text-anchor="middle" font-weight="600">conv.cu</text>
+    <text x="68" y="73" text-anchor="middle" font-size="10.5" fill="#52514e">CUDA C++</text>
+    <line x1="128" y1="60" x2="188" y2="60" stroke="#52514e" stroke-width="1.4" marker-end="url(#arr12)"/>
+    <text x="158" y="50" text-anchor="middle" font-size="10" fill="#52514e">front end</text>
+    <rect x="190" y="34" width="130" height="52" rx="6" fill="#d6e6ff" stroke="#2a78d6" stroke-width="1.5"/>
+    <text x="255" y="56" text-anchor="middle" font-weight="600">PTX</text>
+    <text x="255" y="73" text-anchor="middle" font-size="10.5" fill="#52514e">portable, virtual</text>
+    <line x1="320" y1="60" x2="380" y2="60" stroke="#52514e" stroke-width="1.4" marker-end="url(#arr12)"/>
+    <text x="350" y="50" text-anchor="middle" font-size="10" fill="#52514e">ptxas</text>
+    <rect x="382" y="34" width="140" height="52" rx="6" fill="#86b6ef" stroke="#2a78d6" stroke-width="1.5"/>
+    <text x="452" y="56" text-anchor="middle" font-weight="600">SASS for sm_61</text>
+    <text x="452" y="73" text-anchor="middle" font-size="10.5" fill="#1c3a5e">real machine code</text>
+    <line x1="522" y1="60" x2="574" y2="60" stroke="#52514e" stroke-width="1.4" marker-end="url(#arr12)"/>
+    <rect x="576" y="20" width="96" height="80" rx="6" fill="#ffe7c2" stroke="#eda100" stroke-width="1.5"/>
+    <text x="624" y="44" text-anchor="middle" font-weight="600" font-size="11">conv.obj</text>
+    <text x="624" y="61" text-anchor="middle" font-size="10" fill="#52514e">"fat binary":</text>
+    <text x="624" y="76" text-anchor="middle" font-size="10" fill="#52514e">SASS + PTX,</text>
+    <text x="624" y="91" text-anchor="middle" font-size="10" fill="#52514e">side by side</text>
+    <path d="M 255 86 L 255 132 L 566 132" fill="none" stroke="#52514e" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="560" y1="132" x2="600" y2="112" stroke="#52514e" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr12)"/>
+    <text x="300" y="150" font-size="10" fill="#52514e">the embedded PTX lets a future GPU's driver recompile the kernel at load time ("JIT")</text>
+  </g>
+</svg>
+<div class="cap"><b>Figure 12.1</b> — The two-stage compilation pipeline. The front end produces
+portable PTX; <code>ptxas</code> turns it into machine code for one specific chip. Our build embeds
+both into the object file, which is why <code>cuobjdump</code> can show either one.</div>
+</div>
+
+<p>The division of labor matters more than the naming. The front end that produces PTX does the
+language work — templates, loop unrolling, constant folding. But nearly all of the
+<i>optimization</i> we care about in these notes happens inside <code>ptxas</code>: it assigns the
+real registers, selects the actual instructions, folds constant-memory reads into arithmetic
+operands, and decides the instruction order that hides load latency. This has a practical
+consequence: PTX can look naive and the final code still be excellent, so conclusions about
+performance should be drawn from SASS, and from SASS only. PTX's role in our workflow is
+different — it is far easier to read, keeps variable names, and shows what the front end handed
+over, which makes it the right place to <i>start</i> when the SASS is confusing.</p>
+
+<p>Getting both is one command each. The build already compiles every kernel into an object file,
+and <code>cuobjdump</code> extracts either language from it:</p>
+
+<pre><code>cuobjdump -sass build/cuda_kernels.dir/Release/conv.obj   &gt; conv_sass.txt
+cuobjdump -ptx  build/cuda_kernels.dir/Release/conv.obj   &gt; conv_ptx.txt</code></pre>
+
+<p>One note on names: the listings identify each kernel by its C++ "mangled" name, in which the
+compiler encodes the signature. It is decodable at a glance once seen —
+<code>_Z23conv2dTiledUnrollKernelILi4EEvPKfPfii</code> is
+<code>conv2dTiledUnrollKernel&lt;4&gt;</code> (the <code>ILi4EE</code> is the template argument
+<code>&lt;int 4&gt;</code>), taking pointer-to-const-float, pointer-to-float, int, int. Each
+template instantiation appears as its own complete kernel, which is the "one compiled copy per
+radius" of chapter 10 made visible.</p>
+
+<h2>12.2 The vocabulary: enough SASS to read a listing</h2>
+
+<p>A SASS instruction has a regular shape: an optional <i>predicate guard</i>, an opcode with
+modifiers separated by dots, then a destination register and source operands, left to right. A
+line from chapter 11's kernel, fully parsed:</p>
+
+<pre><code>@!P1  FFMA  R0, R23, R25, R0 ;
+ │     │     │   └────┴── sources: multiply R23 by R25 …
+ │     │     └── destination: … add R0, write the result to R0
+ │     └── the opcode: Fused Float Multiply-Add
+ └── the guard: only keep the result in lanes where predicate P1 is false</code></pre>
+
+<p>Registers come in two kinds. <b>R0–R254</b> are the ordinary 32-bit registers — the same ones
+whose per-thread count sets occupancy in chapter 2. Two of them are special constants wired into
+the hardware: <b>RZ</b> always reads as zero, and the predicate <b>PT</b> always reads as true.
+They exist so that common cases need no setup: initializing an accumulator is just using RZ as the
+add-input of an FFMA, and an unconditional instruction is one guarded by PT. <b>P0–P6</b> are
+<i>predicate registers</i> — single true/false bits, written by compare instructions and consumed
+by the <code>@P</code> guards. This is the machinery of predication from chapter 2.7, now visible
+by name.</p>
+
+<p>The operand form <code>c[<i>bank</i>][<i>offset</i>]</code> reads constant memory: bank number
+first, byte offset second. Two banks appear constantly. <b>Bank 0</b> is where the launch places
+everything a kernel is told at startup: the block dimensions live near the front (on this chip
+<code>c[0x0][0x8]</code> is <code>blockDim.x</code>), and the kernel's own arguments start at
+offset <code>0x140</code> — for a 2D convolution call, <code>in</code> at 0x140, <code>out</code>
+at 0x148 (pointers take 8 bytes), then H, W, r at 0x150, 0x154, 0x158. <b>Bank 3</b> is where our
+<code>__constant__</code> arrays live: <code>c_mask1d</code> first, and — since it occupies 17
+floats, 68 = 0x44 bytes — <code>c_mask2d</code> begins at <code>c[0x3][0x44]</code>. That one
+detail decodes every mask access in this chapter.</p>
+
+<p>The instructions themselves are few. The table gives every mnemonic used in this chapter, in
+plain words; it is the working dictionary for all the listings that follow.</p>
+
+<table class="glos">
+  <tr><th>Instruction</th><th>What it does</th></tr>
+  <tr><td>MOV, MOV32I</td><td>copy a value into a register (from a register/constant, or a 32-bit literal baked into the instruction)</td></tr>
+  <tr><td>S2R</td><td>"special to register": read a special register such as SR_TID.X (threadIdx.x) or SR_CTAID.X (blockIdx.x — CTA, cooperative thread array, is the hardware's word for a block)</td></tr>
+  <tr><td>IADD, IADD32I, IADD3</td><td>integer add (two registers; register plus literal; three values at once)</td></tr>
+  <tr><td>ISCADD</td><td>scaled add: shift one operand left, then add — one instruction for the ubiquitous <code>base + index*4</code></td></tr>
+  <tr><td>SHL, SHR</td><td>shift left / right (multiply / divide by a power of two)</td></tr>
+  <tr><td>XMAD</td><td>16-bit multiply with 32-bit accumulate. Pascal's integer multiplier is only 16 bits wide, so one full 32&times;32 multiply compiles to <i>three</i> XMADs — every <code>blockIdx.x * blockDim.x</code> costs three instructions</td></tr>
+  <tr><td>ISETP</td><td>integer compare ("integer set predicate"): writes true/false into a predicate register; variants chain, e.g. ISETP.GE.OR folds a previous predicate in with an OR</td></tr>
+  <tr><td>PSETP</td><td>combine predicates into a predicate — pure boolean logic on the P registers</td></tr>
+  <tr><td>FFMA</td><td>fused float multiply-add: <code>d = a*b + c</code>, one instruction, one issue slot — the only instruction in this chapter that does the kernel's actual mathematics</td></tr>
+  <tr><td>LDG / STG</td><td>load / store <i>global</i> memory. Suffix .E means a 64-bit ("extended") address; suffix <b>.CI</b> reroutes the load through the small per-SM read-only cache — the entire effect of <code>__restrict__</code>, of which more below</td></tr>
+  <tr><td>LDS / STS</td><td>load / store <i>shared</i> memory</td></tr>
+  <tr><td>LDC</td><td>load from <i>constant</i> memory as a separate instruction — needed only when the offset is computed at run time; a compile-time offset rides inside the consuming instruction as a <code>c[ ][ ]</code> operand instead, costing nothing</td></tr>
+  <tr><td>BRA, EXIT</td><td>branch to an address / end the thread. (After EXIT, listings show a branch-to-itself plus NOPs — padding, never executed)</td></tr>
+  <tr><td>SSY, SYNC</td><td>the divergence bookkeeping of chapter 2.7: SSY declares, ahead of a possibly-divergent region, the address where the warp's lanes will reconverge; SYNC is a lane arriving at that meeting point</td></tr>
+  <tr><td>BAR.SYNC</td><td><code>__syncthreads()</code> — the block-wide barrier (a MEMBAR memory fence rides along with it)</td></tr>
+  <tr><td>I2F, F2I, MUFU</td><td>convert int&harr;float, and the "multi-function unit" (the special-function hardware of chapter 2.4) computing an approximate reciprocal — these three appear together when the compiler must divide by a number it does not know</td></tr>
+  <tr><td>DEPBAR</td><td>wait until enough of the still-in-flight loads above have delivered — the scoreboard of chapter 2, being consulted explicitly</td></tr>
+</table>
+
+<p>Finally, the raw listing format. <code>cuobjdump</code> prints each instruction with its byte
+address in comments (<code>/*0208*/</code> — instructions are 8 bytes on this chip, so addresses
+step by 8), followed by the instruction's hexadecimal encoding on the right. Interleaved between
+them, one line per three instructions, sits a bare hex "control word": pre-computed scheduling
+hints — how long to stall, which scoreboard slots to wait on — that chapter 2's schedulers consume
+so they never have to figure dependencies out at run time. The excerpts below strip the encodings
+and control words and keep only addresses where a branch needs its target; everything else is
+verbatim.</p>
+
+<h2>12.3 A complete kernel, line by line</h2>
+
+<p>The best first listing is a small kernel we know intimately: the unrolled 1D convolution of
+chapter 10, instantiated at radius 1 — <code>conv1dTiledUnrollKernel&lt;1&gt;</code>. Its source
+is a dozen lines: a loop that stages <code>blockDim.x + 2</code> floats into the shared tile with
+zero padding, a barrier, three taps, and a guarded store. The complete compiled kernel is 44
+instructions, and every one of them can be accounted for. Here is the source, for reference, with
+R already substituted as 1:</p>
+
+<pre><code>int tileSize   = blockDim.x + 2;                              // (a)
+int blockStart = blockDim.x * blockIdx.x;                     // (b)
+for (int s = threadIdx.x; s &lt; tileSize; s += blockDim.x) {    // (c)
+    if (blockStart - 1 + s &gt;= 0 &amp;&amp; blockStart - 1 + s &lt; n)    // (d)
+        tile[s] = in[blockStart - 1 + s];                     // (e)
+    else
+        tile[s] = 0.0f;                                       // (f)
+}
+__syncthreads();                                              // (g)
+float sum = 0.0f;
+for (int j = -1; j &lt;= 1; j++)                                 // unrolled
+    sum += c_mask1d[j + 1] * tile[1 + threadIdx.x + j];       // (h)
+if (blockStart + threadIdx.x &lt; n)                             // (i)
+    out[blockStart + threadIdx.x] = sum;                      // (j)</code></pre>
+
+<p><b>The prologue.</b> Every kernel opens the same way: set up the stack pointer, then gather
+what the thread needs to know about itself. Note how source line (a) has already been folded — the
+compiler adds the literal 2 rather than computing 2*R:</p>
+
+<pre><code>MOV R1, c[0x0][0x20] ;             // standard prologue: set up the stack pointer
+MOV R0, c[0x0][0x8] ;              // R0 = blockDim.x            — launch info, bank 0     (a)
+S2R R9, SR_TID.X ;                 // R9 = threadIdx.x
+IADD32I R0, R0, 0x2 ;              // R0 = blockDim.x + 2        = tileSize                (a)
+S2R R6, SR_CTAID.X ;               // R6 = blockIdx.x
+SSY 0x140 ;                        // divergence ahead — lanes will reconverge at 0x140
+ISETP.GE.AND P0, PT, R9, R0, PT ;  // P0 = (threadIdx.x &gt;= tileSize)?  = loop entry test   (c)
+@P0 SYNC ;                         // lanes with nothing to load go wait at 0x140</code></pre>
+
+<p>The last two lines are the <code>for</code> loop's entry test. With 256 threads and a 258-slot
+tile no thread skips the loop in practice, but the compiler cannot know that, so the machinery is
+there: lanes that would fail the test immediately branch to the reconvergence address that SSY
+declared. Next, line (b) — and here is Pascal's 16-bit multiplier at work, three XMADs for one
+32-bit multiply. The compiler starts the accumulate at &minus;1, getting the
+"<code>&minus; R</code>" of line (d) for free inside the multiply-add:</p>
+
+<pre><code>MOV32I R4, 0xffffffff ;                  // R4 = -1  (this is "-R" with R=1)
+XMAD.MRG R3, R6, c[0x0][0x8].H1, RZ ;    // ┐
+XMAD R4, R6, c[0x0][0x8], R4 ;           // ├ R4 = blockIdx.x * blockDim.x - 1              (b,d)
+XMAD.PSL.CBCC R4, R6.H1, R3.H1, R4 ;     // ┘   (three XMADs = one 32-bit multiply)
+MOV R5, R9 ;                             // s = threadIdx.x                                 (c)</code></pre>
+
+<p><b>The load loop.</b> This is the body executed once per lap, and it is worth reading slowly,
+because it contains in miniature everything chapter 2 taught about predication and divergence. The
+default value is set to zero first, unconditionally; the load happens only in lanes whose index is
+in range; and both kinds of lane meet again at the shared-memory store, so every slot gets written
+— the zero padding of line (f) costs exactly one MOV of RZ:</p>
+
+<pre><code>0x090:
+IADD R3, R4, R5 ;                            // g = blockStart - 1 + s: the global index  (d)
+SSY 0x120 ;                                  // the 'if' begins; reconverge just before STS
+ISETP.GE.AND P0, PT, R3, c[0x0][0x150], PT ; // P0 = (g &gt;= n)?         n is at bank0+0x150 (d)
+SHL R7, R5, 0x2 ;                            // R7 = s * 4: byte offset of tile[s]
+IADD R5, R5, c[0x0][0x8] ;                   // s += blockDim.x — already, for the next lap (c)
+ISETP.LT.OR P0, PT, R3, RZ, P0 ;             // P0 = P0 or (g &lt; 0): "out of range?"        (d)
+ISETP.GE.AND P1, PT, R5, R0, PT ;            // P1 = "was this the last lap?"              (c)
+MOV R2, RZ ;                                 // value = 0.0f — the padding, as the default (f)
+@P0 SYNC ;                                   // out-of-range lanes skip ahead, keeping the 0
+SHR R8, R3, 0x1e ;                           // ┐ pointers are 64-bit: extend g*4's sign,
+ISCADD R2.CC, R3, c[0x0][0x140], 0x2 ;       // ├ add (g&lt;&lt;2) to in's low half, carry out,
+IADD.X R3, R8, c[0x0][0x144] ;               // ┘ add carry into in's high half
+LDG.E R2, [R2] ;                             // value = in[g] — the global-memory load     (e)
+SYNC ;                                       // reconvergence: both paths arrive here
+STS [R7], R2 ;                               // tile[s] = value — store to shared          (e,f)
+@!P1 BRA 0x90 ;                              // not the last lap → go around again         (c)
+SYNC ;                                       // loop done — reconverge at SSY 0x140's target</code></pre>
+
+<p>Three details deserve a pause. First, the loop increment and the exit test happen <i>early</i>,
+in the middle of the body — the compiler hoists independent work upward so no instruction has to
+wait on its neighbor; source order is a suggestion, dependency order is the law. Second, the
+64-bit address arithmetic: every <code>in[g]</code> costs a three-instruction sandwich
+(SHR / ISCADD with carry-out / IADD.X with carry-in) because index arithmetic is 32-bit but
+pointers are not. Third, count the cost of the bounds check on line (d): two ISETPs, plus the
+divergence bookkeeping around the load. Chapter 11 called this the "instruction tax," and here it
+is, itemized.</p>
+
+<p><b>The barrier and the payoff.</b> After the loop, the barrier, then the three taps. This is
+the excerpt that justifies the whole chapter — compare it to source line (h):</p>
+
+<pre><code>XMAD R4, R6, c[0x0][0x8], R9 ;         // start i = blockIdx.x*blockDim.x + threadIdx.x  (i)
+BAR.SYNC 0x0 ;                         // __syncthreads()                                (g)
+MEMBAR.CTA ;                           // …with its block-scope memory fence
+XMAD.MRG R3, R6, c[0x0][0x8].H1, RZ ;  // (multiply, part 2)
+SHL R0, R9, 0x2 ;                      // byte offset of tile[threadIdx.x]
+LDS.U.32 R2, [R0] ;                    // tile[tid+0]   ┐ the three taps' values —       (h)
+XMAD.PSL.CBCC R4, R6.H1, R3.H1, R4 ;   // (part 3)      │ all three loads issued
+LDS.U.32 R3, [R0+0x4] ;                // tile[tid+1]   │ back-to-back, so their         (h)
+ISETP.GE.U32.AND P0, PT, R4, c[0x0][0x150], PT ; // i&gt;=n?│ latencies overlap             (i)
+LDS.U.32 R5, [R0+0x8] ;                // tile[tid+2]   ┘                                (h)
+@P0 EXIT ;                             // out-of-range thread? nothing to store — leave  (i)
+FFMA R0, R2, c[0x3][0x0], RZ ;         // sum = tile[tid]*mask[0] + 0   — RZ: free zero  (h)
+SHR.U32 R6, R4, 0x1e ;                 // ┐
+ISCADD R2.CC, R4, c[0x0][0x148], 0x2 ; // ├ 64-bit address of out[i]  (out is at 0x148)  (j)
+FFMA R0, R3, c[0x3][0x4], R0 ;         // sum += tile[tid+1] * mask[1]                   (h)
+IADD.X R3, R6, c[0x0][0x14c] ;         // ┘
+FFMA R0, R5, c[0x3][0x8], R0 ;         // sum += tile[tid+2] * mask[2]                   (h)
+STG.E [R2], R0 ;                       // out[i] = sum                                   (j)
+EXIT ;</code></pre>
+
+<p>Everything chapters 10 and 11 claimed is sitting in plain sight. The mask never gets a load
+instruction: <code>c[0x3][0x0]</code>, <code>[0x4]</code>, <code>[0x8]</code> are
+<code>c_mask1d[0..2]</code> riding inside the FFMAs as constant-bank operands. The accumulator is
+never initialized: the first FFMA adds RZ. The <code>if</code> of line (i) became a predicated
+EXIT placed <i>before</i> the arithmetic — the compiler proved that a thread which will not store
+has nothing left to do — and yet the three shared-memory loads sit <i>above</i> that exit, issued
+early so their latency is covered by the address arithmetic between them. Even the unrolled loop's
+three iterations are simply three FFMA lines: no counter, no compare, no branch. Two instructions
+per tap, and the second one is only a load.</p>
+
+<p><b>The same kernel in PTX</b> makes a useful contrast. Here is its compute section,
+front-end output before <code>ptxas</code> has touched it:</p>
+
+<pre><code>bar.sync 0;                          // __syncthreads()
+shl.b32 %r15, %r4, 2;                // %r4 holds threadIdx.x — PTX registers are named,
+mov.u32 %r16, tile;                  //   typed (%r int, %f float, %rd 64-bit, %p predicate)
+add.s32 %r17, %r16, %r15;            //   and unlimited — a fiction ptxas later makes real
+ld.shared.f32 %f5, [%r17];           // tile[tid+0]
+ld.const.f32  %f6, [c_mask1d];       // mask[0] — still a separate load, by NAME
+fma.rn.f32 %f7, %f6, %f5, 0f00000000;
+ld.shared.f32 %f8, [%r17+4];         // tile[tid+1]
+ld.const.f32  %f9, [c_mask1d+4];     // mask[1]
+fma.rn.f32 %f10, %f9, %f8, %f7;
+ld.shared.f32 %f11, [%r17+8];        // tile[tid+2]
+ld.const.f32  %f12, [c_mask1d+8];    // mask[2]
+fma.rn.f32 %f3, %f12, %f11, %f10;</code></pre>
+
+<p>Readable, honest — and slower-looking than the truth. PTX still spends an explicit
+<code>ld.const</code> on every mask weight, and its loads and multiplies alternate in naive source
+order. Both "problems" evaporate inside <code>ptxas</code>: the constant loads fold into the FFMAs,
+and the schedule is rewritten. This is the lesson of the two languages in one screenful — PTX
+tells you what the front end understood; only SASS tells you what the machine will do.</p>
+
+<h2>12.4 The conv2d ladder, retold in instructions</h2>
+
+<p>Chapter 11 descended a ladder: 15.0 &rarr; 10.6 &rarr; 8.4 &rarr; 3.9 milliseconds. Each step
+was diagnosed at the time with measurements and one or two lines of assembly. Now we can hold the
+four compiled kernels side by side and watch the instructions themselves fall away. One counting
+convention first: a <i>static</i> listing is not what executes. Kernel D's listing is 141
+instructions, but its loops run 81 times per pixel — what matters is the instructions <i>issued</i>
+per output pixel, and chapter 2.5 taught why: every instruction, predicated or not, costs one of
+the SM's issue slots.</p>
+
+<h3>Step one: __restrict__ is a one-suffix diff (15.0 → 10.6 ms)</h3>
+
+<p>To see exactly what <code>__restrict__</code> did to kernel D, the experiment for this chapter
+recompiled the identical kernel with the qualifiers removed, and diffed the two SASS listings
+instruction by instruction. The entire diff, for a 141-instruction kernel, is this — repeated
+seven times, once per load site:</p>
+
+<pre><code>&lt;   LDG.E    R18, [R2]      // without __restrict__: plain global load, straight to L2
+---
+&gt;   LDG.E.CI R18, [R2]      // with    __restrict__: same load, rerouted through the
+                            // per-SM read-only cache</code></pre>
+
+<p>Not one instruction added, removed, or reordered. The two-character suffix is the whole
+optimization: it tells the load to travel through the small read-only cache inside each SM (the
+path chapter 3.4 described), so a tap that a neighboring thread just fetched is a few cycles away
+instead of an L2 round trip. Four and a half milliseconds — from two characters of SASS, from ten
+characters of C++. It is worth internalizing how invisible this would be without the listing: no
+count changes, no structure changes; a profiler would show only "memory got faster."</p>
+
+<h3>Step two: the price of a bounds check, itemized (why D stalls at 10.6 ms)</h3>
+
+<p>Kernel D's inner loop checks every tap against all four image edges. The compiler unrolls the
+loop four taps at a time, and each tap inside the unrolled body costs the same seven-instruction
+pattern — here is one tap, verbatim:</p>
+
+<pre><code>IADD32I R3, R2, 0x1 ;                          // this tap's column: col + dx
+ISETP.GE.AND P1, PT, R3, RZ, PT ;              // P1 = (column &gt;= 0)?
+ISETP.GE.OR  P1, PT, R3, c[0x0][0x154], !P1 ;  // P1 = out of range either side (W at 0x154)
+PSETP.OR.AND P1, PT, !P0, P1, PT ;             // fold in the row check, done once per row
+@!P1 LDG.E.CI R25, [R2+0x4] ;                  // the input pixel — only lanes in range
+@!P1 LDC      R23, c[0x3][R24+0x48] ;          // the mask weight — offset is in a register
+@!P1 FFMA R0, R23, R25, R0 ;                   // sum += pixel * weight   ← the useful one</code></pre>
+
+<p>Add the overhead shared across each group of four taps — the three-instruction 64-bit address
+sandwich, the loop counter, the end-of-row compare and branch, a DEPBAR wait — and the steady-state
+cost is 40 instructions per 4 taps: <b>ten instructions per tap, of which one is mathematics</b>.
+Note also that the mask weight needs a real LDC here, because with r a runtime value the offset
+<code>(dy+r)*(2r+1)+(dx+r)</code> is computed in a register — compare the warm-up kernel, where
+the offset was a literal and the load vanished into the FFMA.</p>
+
+<p>The issue-slot arithmetic from chapter 2 now explains the wall. Eighty-one taps at ten
+instructions each, plus prologue, is roughly 840 issued instructions per pixel; over 16.7 million
+pixels, grouped 32 to a warp, that is about 440 million warp-instructions. This card issues at
+most 4 per cycle per SM &times; 10 SMs &times; ~1.3 GHz &asymp; 52 billion per second — so merely
+<i>issuing</i> kernel D takes about 8.5 ms before a single byte moves. Measured: 10.6. The kernel
+is pinned to the issue wall, and no cache can help it; only deleting instructions can.</p>
+
+<h3>Step three: what a runtime radius does to a loop (8.4 ms)</h3>
+
+<p>The tiled kernel E deletes the bounds checks by baking zero padding into the tile, and its
+compute loop is honest: load a tile value (LDS), load a mask weight (LDC), multiply-add (FFMA).
+But because r arrives at runtime, the compiler must generate for <i>every possible</i> trip count,
+and the listing shows it hedging. It emits the inner-row loop <i>four times over</i>: a peeling
+section that handles up to three taps to reach alignment, a sixteen-at-a-time fast path, an
+eight-at-a-time path, and a four-at-a-time cleanup — 31 LDS, 31 LDC, and 31 FFMA statically,
+plus 21 compares and 11 branches deciding, at run time, which body to use. The fateful guard,
+verbatim from the listing:</p>
+
+<pre><code>ISETP.GT.AND P2, PT, R17, 0xc, PT ;   // more than 12 taps left in this row?
+@!P2 BRA 0x830 ;                      // no → skip the 16-wide fast path entirely</code></pre>
+
+<p>Our rows have nine taps. Nine is never greater than twelve, so the branch is taken on every
+row of every pixel, and the most carefully optimized code in the kernel never executes. The taps
+run instead through the smaller sections, paying the between-section machinery each row —
+roughly five issued instructions per tap in practice, twice per tap on the load pipes (an LDS
+<i>and</i> an LDC).</p>
+
+<p>The same runtime blindness shows up one more time, in the tile-loading loop, and the contrast
+is instructive even though this loop only runs twice per thread. Kernel E must compute
+<code>s / side_c</code> and <code>s % side_c</code> where <code>side_c = 32 + 2r</code> is not
+known. There is no integer-divide instruction; the compiler emits a conversion to floating point,
+an approximate reciprocal on the special-function unit, and a fix-up-and-verify chain — about
+twenty instructions:</p>
+
+<pre><code>I2F.F32.S32.RP R7, |R3| ;      // side_c, as a float
+MUFU.RCP R7, R7 ;              // ≈ 1/side_c, from the special-function unit
+IADD32I R8, R7, 0xffffffe ;    // nudge the approximation
+F2I.FTZ.U32.F32.TRUNC R8, R8 ; // back to integer…
+…                              // then multiply-back, correct, and derive the remainder
+                               // — ~20 instructions for one division</code></pre>
+
+<p>The unrolled kernel F2 divides by the same quantity — but there it is the literal 40, and the
+compiler replaces division with a fixed-point trick: multiply by <code>0x66666667</code> (a 32-bit
+encoding of 2&frasl;5), keep the high half, shift right by 4. Same source line, ten cheap
+instructions instead of twenty with no special-function trip — purely because the compiler knew
+the number.</p>
+
+<h3>Step four: the kernel with nothing left to remove (3.9 ms)</h3>
+
+<p>Give the compiler the radius — <code>template &lt;int R&gt;</code>, dispatch switch, unroll
+pragmas — and every hedge above becomes unnecessary. Here is the start of
+<code>conv2dTiledUnrollKernel&lt;4&gt;</code>'s compute phase:</p>
+
+<pre><code>LDS.U.32 R4, [R3] ;               // window row 0, tap 1 — every offset now a literal
+LDS.U.32 R5, [R3+0x4] ;           // row 0, tap 2
+LDS.U.32 R6, [R3+0x8] ;           // row 0, tap 3
+LDS.U.32 R7, [R3+0xc] ;           // row 0, tap 4
+LDS.U.32 R9, [R3+0x10] ;          // row 0, tap 5
+LDS.U.32 R10, [R3+0x478] ;        // …and one from row 7, fetched ~70 instructions early
+FFMA R4, R4, c[0x3][0x44], RZ ;   // tap 1: weight = c_mask2d[0] baked in; RZ starts the sum
+FFMA R4, R5, c[0x3][0x48], R4 ;   // tap 2 — and so on, LDS/FFMA, to the end of the kernel</code></pre>
+
+<p>Every number in this excerpt decodes with section 12.2's table. The tile offsets step by 4
+bytes along a row and by <code>0xa0</code> = 160 bytes = 40 floats between rows — the tile's
+stride, <code>32 + 2&middot;4</code>, now a compile-time fact baked into every address (offset
+<code>0x478</code> is row 7, column 6: the compiler launches some far-future loads absurdly early,
+because with literal offsets nothing stops it). The mask weights start at <code>c[0x3][0x44]</code>
+because <code>c_mask1d</code>'s 68 bytes sit in front of <code>c_mask2d</code> in bank 3. The LDC
+is gone — every weight is an operand. The loop is gone. The bounds checks are gone (the padding
+absorbed them). What remains, for the entire 81-tap computation, is the instruction census
+chapter 11 quoted, now verifiable by anyone with grep:</p>
+
+<table>
+  <tr><th>Kernel (all with __restrict__)</th><th class="num">static size</th><th class="num">FFMA</th><th>memory instructions</th><th class="num">compare + branch</th><th class="num">issued per pixel</th><th class="num">measured</th></tr>
+  <tr><td>D — const mask, bounds checks</td><td class="num">141</td><td class="num">7</td><td>7 LDG + 7 LDC</td><td class="num">25 + 8</td><td class="num">~840</td><td class="num">10.6 ms</td></tr>
+  <tr><td>E — tiled, runtime r</td><td class="num">262</td><td class="num">31</td><td>1 LDG, 31 LDS + 31 LDC, 1 STS</td><td class="num">21 + 11</td><td class="num">~420</td><td class="num">8.4 ms</td></tr>
+  <tr><td>F2 — tiled, template&lt;4&gt;</td><td class="num">232</td><td class="num">81</td><td>1 LDG, 81 LDS + 0 LDC, 1 STS</td><td class="num">7 + 2</td><td class="num">~190</td><td class="num">3.9 ms</td></tr>
+</table>
+
+<p>Read the table's columns against each other and the ladder's whole story is in it. The static
+size <i>grows</i> from D to E while the runtime falls — static size is not cost; loops are. The
+FFMA count rises to exactly 81 — the mathematics was always 81 operations, and F2 is the first
+version that spends almost nothing else. The compare-and-branch column collapses from 33 to 9 —
+and of F2's nine, seven belong to the load loop and the final store guard, none to the taps.
+And the issued-per-pixel column, divided into the measured times, degrades gracefully from
+"explains everything" (D is issue-bound, 8.5 of its 10.6 ms is pure issuing) to "explains the
+floor" — F2's ~190 include 81 shared-memory loads, and chapter 11 already showed those loads'
+pipe throughput accounts for ~3 of its 3.9 ms. When the census stops predicting the time, the
+census is telling you which hardware pipe took over as the wall.</p>
+
+<h2>12.5 The working method</h2>
+
+<p>Everything above reduces to a repeatable recipe, and it is the same one that diagnosed
+chapter 11 when the profiler was locked out:</p>
+
+<ol>
+  <li>Dump the SASS: <code>cuobjdump -sass build/cuda_kernels.dir/Release/&lt;file&gt;.obj</code>.
+  Find your kernel by its mangled name; template instantiations are separate kernels.</li>
+  <li>Census first, read second. Count FFMA, LDG, LDS, LDC, ISETP, BRA per kernel (grep does it).
+  The ratio of mathematics to everything else is the single most informative number in the
+  listing.</li>
+  <li>Find the hot loop — the BRA that jumps backward — and cost one iteration by hand:
+  instructions per useful operation. Predicated instructions count; they issue either way.</li>
+  <li>Diff variants instead of reading either one whole. The __restrict__ finding took a
+  recompile and a seven-line diff; reading 141 instructions cold would have taken an hour and
+  found the same thing.</li>
+  <li>Distrust PTX for performance conclusions. Its explicit constant loads and naive schedule
+  are routinely optimized away; if PTX and SASS disagree, SASS is what runs.</li>
+  <li>Connect counts to time through chapter 2's issue arithmetic — issued warp-instructions
+  divided by the card's issue rate is a hard floor. When measured time approaches it, stop
+  optimizing memory and start deleting instructions; when time sits far above it, the wall is
+  a pipe, not the issue rate.</li>
+</ol>
+
+<div class="keybox"><span class="kb-t">WHAT TO REMEMBER</span><br>
+CUDA compiles twice: front end to portable PTX, then <code>ptxas</code> to the chip's real SASS —
+and the optimization that matters happens in the second step, so judge performance only from SASS.
+A listing is readable with a dozen mnemonics, two special registers (RZ = zero, PT = true), and
+one addressing convention (bank 0 = launch arguments, bank 3 = your <code>__constant__</code>
+data). What the compiler knows at compile time decides everything: a known radius turned ten
+instructions per tap into two, a known divisor turned a twenty-instruction division into a
+multiply-and-shift, a known offset made mask loads vanish into FFMA operands. The census — grep
+counting instruction kinds — is a profiler nobody can lock: it found a two-character diff worth
+4.4 ms, a fast path that could never run, and a kernel whose compute phase is 162 instructions of
+pure load-and-accumulate. Every listing regenerates in seconds with one <code>cuobjdump</code>
+command on the build's object files; nothing in this chapter needed the GPU to be running.</div>
+
+<h1><span class="chip">13</span>Cross-cutting principles</h1>
 
 <p>Seven kernels produced a small set of rules that kept proving themselves. Each one below is
 stated in full and then anchored to the chapter where it was paid for, so that when a rule stops
@@ -1534,9 +2003,9 @@ sounding convincing, you can revisit the measurement that made it true.</p>
   (Chapters 4, 10, 11.)</li>
 </ol>
 
-<h1><span class="chip">13</span>Results and glossary</h1>
+<h1><span class="chip">14</span>Results and glossary</h1>
 
-<h2>13.1 Every measured result in one place</h2>
+<h2>14.1 Every measured result in one place</h2>
 <p>The table records the final measured numbers for each kernel's ladder of versions, in the order
 the versions were built. All were taken on the GTX 1060 Max-Q described in chapter 1, using
 median-of-samples timing.</p>
@@ -1561,12 +2030,12 @@ median-of-samples timing.</p>
 
 <div class="fig">
   <img src="../perf.png" alt="Measured kernel throughput chart" style="max-width: 92%;">
-  <div class="cap"><b>Figure 13.1</b> — The project scoreboard, <code>docs/perf.png</code>. It is
+  <div class="cap"><b>Figure 14.1</b> — The project scoreboard, <code>docs/perf.png</code>. It is
   regenerated at the end of every session by a script that runs every test binary and refuses to plot
   anything if a single correctness check fails.</div>
 </div>
 
-<h2>13.2 Glossary</h2>
+<h2>14.2 Glossary</h2>
 <p>Terms are listed roughly in the order the notes introduce them.</p>
 <table class="glos">
   <tr><th>Term</th><th>Meaning</th></tr>
@@ -1591,11 +2060,16 @@ median-of-samples timing.</p>
   <tr><td>roofline / ridge</td><td>the two-ceiling performance model / the intensity (~20.3 here) where the memory and compute ceilings meet</td></tr>
   <tr><td>effective bandwidth</td><td>ideal (must-move) bytes divided by time — a score against perfection rather than a report of actual traffic</td></tr>
   <tr><td>__restrict__</td><td>the programmer's promise that a pointer's memory is accessed through that pointer alone, enabling the read-only load path</td></tr>
-  <tr><td>SASS</td><td>the GPU's real assembly language, viewable with <code>cuobjdump -sass</code>; the ground truth of what the compiler produced</td></tr>
+  <tr><td>SASS</td><td>the GPU's real assembly language, viewable with <code>cuobjdump -sass</code>; the ground truth of what the compiler produced (chapter 12 is a guided tour)</td></tr>
   <tr><td>LDG / LDS / LDC / FFMA</td><td>assembly names for: a global load (suffix .CI marks the read-only path), a shared-memory load, a constant-memory load, and a fused multiply-add</td></tr>
+  <tr><td>PTX</td><td>the portable intermediate assembly the front end produces: virtual registers, variables by name, no target chip; recompiled into SASS by ptxas or, years later, by a newer card's driver</td></tr>
+  <tr><td>ptxas</td><td>the second-stage compiler (PTX &rarr; SASS); register allocation, instruction selection, folding, and scheduling all happen here — judge performance after it, never before</td></tr>
+  <tr><td>c[bank][offset]</td><td>a constant-memory operand in SASS: bank 0 holds launch dimensions and kernel arguments (from 0x140), bank 3 holds <code>__constant__</code> variables</td></tr>
+  <tr><td>XMAD</td><td>Pascal's 16-bit integer multiply-add; one 32-bit multiply (every <code>blockIdx.x*blockDim.x</code>) costs three of them</td></tr>
+  <tr><td>RZ / PT</td><td>hardwired registers reading as zero / true — a free accumulator-start and a "no condition" guard, spent everywhere in compiled code</td></tr>
 </table>
 
-<h1><span class="chip">14</span>What comes next</h1>
+<h1><span class="chip">15</span>What comes next</h1>
 
 <p>The roadmap has three kernels left, each chosen because it teaches a technique nothing so far
 has needed. The <b>histogram</b> introduces a new failure mode: thousands of threads all trying to
