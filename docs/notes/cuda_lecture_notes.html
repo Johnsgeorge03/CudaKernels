@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CUDA Kernel Engineering — Lecture Notes</title>
+<style>
+  @page { size: A4; margin: 12mm 12mm 14mm 12mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    color: #0b0b0b; background: #fff;
+    margin: 0; font-size: 10.5pt; line-height: 1.55;
+  }
+  .cover { text-align: center; padding: 90px 40px 30px; page-break-after: always; }
+  .cover h1 { font-size: 30pt; margin: 0 0 6px; }
+  .cover .sub { font-size: 13pt; color: #52514e; margin: 0 0 40px; }
+  .cover .meta { font-size: 10pt; color: #898781; line-height: 1.8; }
+  h1 {
+    font-size: 17pt; margin: 0 0 10px; padding-bottom: 6px;
+    border-bottom: 2.5px solid #2a78d6; page-break-before: always; page-break-after: avoid;
+  }
+  h1 .chip {
+    display: inline-block; background: #2a78d6; color: #fff; border-radius: 6px;
+    font-size: 10.5pt; padding: 1px 9px; margin-right: 8px; vertical-align: 3px;
+  }
+  h2 { font-size: 12.5pt; margin: 18px 0 6px; page-break-after: avoid; }
+  h3 { font-size: 11pt; margin: 14px 0 4px; page-break-after: avoid; }
+  p { margin: 6px 0; }
+  ul, ol { margin: 6px 0 6px 4px; padding-left: 20px; }
+  li { margin-bottom: 3px; }
+  code {
+    font-family: Consolas, "Courier New", monospace; font-size: 9pt;
+    background: #f2f3f5; border-radius: 3px; padding: 0 3px;
+  }
+  pre {
+    font-family: Consolas, "Courier New", monospace; font-size: 8.6pt; line-height: 1.45;
+    background: #f7f8fa; border: 1px solid #e1e0d9; border-left: 3px solid #2a78d6;
+    border-radius: 4px; padding: 8px 12px; overflow: hidden; white-space: pre-wrap;
+    page-break-inside: avoid; margin: 8px 0;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .fig {
+    text-align: center; margin: 12px auto; page-break-inside: avoid;
+  }
+  .fig svg { max-width: 100%; }
+  .cap {
+    font-size: 8.8pt; color: #52514e; max-width: 620px; margin: 4px auto 0;
+    text-align: center; line-height: 1.45;
+  }
+  .cap b { color: #0b0b0b; }
+  table { border-collapse: collapse; margin: 8px 0; font-size: 9.3pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #d8dce3; padding: 3.5px 9px; text-align: left; }
+  th { background: #eef1f6; font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .keybox {
+    background: #eef4fd; border-left: 4px solid #2a78d6; border-radius: 4px;
+    padding: 8px 12px; margin: 10px 0; page-break-inside: avoid;
+  }
+  .keybox .kb-t { font-weight: 700; color: #1c5cab; font-size: 9.5pt; letter-spacing: 0.4px; }
+  .warnbox {
+    background: #fdf1ef; border-left: 4px solid #d03b3b; border-radius: 4px;
+    padding: 8px 12px; margin: 10px 0; page-break-inside: avoid;
+  }
+  .warnbox .kb-t { font-weight: 700; color: #a52a2a; font-size: 9.5pt; letter-spacing: 0.4px; }
+  .toc { columns: 2; column-gap: 30px; font-size: 10pt; }
+  .toc div { margin-bottom: 3px; }
+  .toc .part { font-weight: 700; margin-top: 8px; column-span: none; }
+  .lessonlist li { margin-bottom: 7px; }
+  .glos td:first-child { font-family: Consolas, monospace; font-size: 8.8pt; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>CUDA Kernel Engineering</h1>
+  <p class="sub">Lecture notes from the CudaKernels project &mdash; seven kernels, measured and explained</p>
+  <p class="meta">
+    Hardware: NVIDIA GTX 1060 Max-Q (Pascal, sm_61)<br>
+    Kernels: matmul &middot; dot product &middot; transpose &middot; GEMV &middot; scan &middot; 1D convolution &middot; 2D convolution<br>
+    Compiled July 2026 &mdash; all numbers measured on this machine, all kernels written by hand
+  </p>
+</div>
+
+<h1 style="page-break-before: avoid;">Contents</h1>
+<div class="toc">
+  <div class="part">Part I — The machine</div>
+  <div>1. The card you are programming</div>
+  <div>2. The execution model: grids, blocks, warps</div>
+  <div>3. The memory hierarchy</div>
+  <div>4. Measuring honestly: rooflines and ratios</div>
+  <div class="part">Part II — The kernels</div>
+  <div>5. Matrix multiplication — reuse and tiling</div>
+  <div>6. Dot product — reductions and atomics</div>
+  <div>7. Transpose — coalescing and bank conflicts</div>
+  <div>8. GEMV — access patterns, and a negative result</div>
+  <div>9. Scan — dependencies, trees, and barriers</div>
+  <div>10. 1D convolution — constant memory and halos</div>
+  <div>11. 2D convolution — the ladder of walls</div>
+  <div class="part">Part III — The playbook</div>
+  <div>12. Cross-cutting principles</div>
+  <div>13. Results and glossary</div>
+  <div>14. What comes next</div>
+</div>
+
+<h1><span class="chip">1</span>The card you are programming</h1>
+
+<p>Every number in these notes was measured on one specific GPU, and its limits shape every
+decision, so know them cold:</p>
+
+<table>
+  <tr><th>Property</th><th>Value</th><th>Why it matters</th></tr>
+  <tr><td>GPU</td><td>GTX 1060 Max-Q (GP106, Pascal)</td><td>compute capability 6.1 (<code>sm_61</code>)</td></tr>
+  <tr><td>SMs (streaming multiprocessors)</td><td>10</td><td>the independent "cores" that run blocks</td></tr>
+  <tr><td>fp32 peak</td><td class="num">~3.9 TFLOP/s</td><td>ceiling for arithmetic</td></tr>
+  <tr><td>DRAM peak bandwidth</td><td class="num">~192 GB/s</td><td>ceiling for streaming data</td></tr>
+  <tr><td>L2 cache (chip-wide)</td><td class="num">1.5 MB</td><td>shared by all SMs</td></tr>
+  <tr><td>Shared memory per SM</td><td class="num">96 KB</td><td>the pool blocks lease slices of</td></tr>
+  <tr><td>Max threads per SM</td><td class="num">2048</td><td>occupancy = resident warps / 64</td></tr>
+  <tr><td>Warp size</td><td class="num">32</td><td>the true unit of execution</td></tr>
+</table>
+
+<p><b>It is a laptop part.</b> Clocks drift with temperature, so absolute timings swing
+±10% run-to-run (and up to ~50% for barrier-heavy kernels across cold/hot states). Two rules
+follow: benchmark with the <i>median</i> of several samples, and when comparing two versions,
+trust the <b>ratio measured in the same run</b>, never absolute numbers from different days.</p>
+
+<h1><span class="chip">2</span>The execution model: grids, blocks, warps</h1>
+
+<p>A kernel launch creates a <b>grid</b> of <b>blocks</b>; each block is a group of up to 1024
+<b>threads</b>. You choose both shapes at launch: <code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...)</code>.
+The hardware assigns whole blocks to SMs, where they stay until they finish.</p>
+
+<div class="fig">
+<svg width="660" height="180" viewBox="0 0 660 180" font-family="Segoe UI, sans-serif">
+  <rect x="8" y="26" width="180" height="130" fill="#eef4fd" stroke="#2a78d6" rx="6"/>
+  <text x="98" y="18" text-anchor="middle" font-size="11" font-weight="600">Grid (your launch)</text>
+  <g>
+    <rect x="20" y="40" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="72" y="40" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="124" y="40" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="20" y="78" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="72" y="78" width="46" height="32" fill="#2a78d6" rx="3"/>
+    <rect x="124" y="78" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="20" y="116" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="72" y="116" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+    <rect x="124" y="116" width="46" height="32" fill="#fff" stroke="#86b6ef" rx="3"/>
+  </g>
+  <text x="98" y="172" text-anchor="middle" font-size="9" fill="#52514e">blocks, scheduled onto SMs</text>
+  <path d="M196 94 L232 94" stroke="#898781" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="238" y="26" width="190" height="130" fill="#eef4fd" stroke="#2a78d6" rx="6"/>
+  <text x="333" y="18" text-anchor="middle" font-size="11" font-weight="600">Block (e.g. 256 threads)</text>
+  <g font-size="8.5" fill="#52514e">
+    <rect x="250" y="42" width="166" height="22" fill="#2a78d6" rx="3"/>
+    <text x="333" y="57" text-anchor="middle" fill="#fff">warp 0 — threads 0..31</text>
+    <rect x="250" y="70" width="166" height="22" fill="#86b6ef" rx="3"/>
+    <text x="333" y="85" text-anchor="middle" fill="#0b0b0b">warp 1 — threads 32..63</text>
+    <rect x="250" y="98" width="166" height="22" fill="#86b6ef" rx="3"/>
+    <text x="333" y="113" text-anchor="middle" fill="#0b0b0b">warp 2 — threads 64..95</text>
+    <text x="333" y="140" text-anchor="middle" fill="#898781">… 8 warps total</text>
+  </g>
+  <text x="333" y="172" text-anchor="middle" font-size="9" fill="#52514e">carved into warps of 32</text>
+  <path d="M436 94 L472 94" stroke="#898781" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="478" y="26" width="174" height="130" fill="#eef4fd" stroke="#2a78d6" rx="6"/>
+  <text x="565" y="18" text-anchor="middle" font-size="11" font-weight="600">Warp = 32 lanes</text>
+  <g>
+    <rect x="490" y="48" width="150" height="26" fill="#2a78d6" rx="3"/>
+    <text x="565" y="65" text-anchor="middle" font-size="8.5" fill="#fff">one instruction, 32 lanes</text>
+    <text x="565" y="98" text-anchor="middle" font-size="8.8" fill="#52514e">lockstep (SIMT): all lanes</text>
+    <text x="565" y="112" text-anchor="middle" font-size="8.8" fill="#52514e">execute the same instruction</text>
+    <text x="565" y="126" text-anchor="middle" font-size="8.8" fill="#52514e">at the same time</text>
+  </g>
+  <text x="565" y="172" text-anchor="middle" font-size="9" fill="#52514e">the true unit of execution</text>
+  <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#898781"/></marker></defs>
+</svg>
+<div class="cap"><b>Figure 2.1</b> — The three levels. You program threads, but the hardware executes
+<i>warps</i>: 32 threads marching in lockstep. Almost every performance effect in these notes
+(coalescing, divergence, bank conflicts, shuffles) is a warp-level effect.</div>
+</div>
+
+<h2>2.1 Which threads share a warp — it depends on block shape</h2>
+<p>Threads are packed into warps by their linear index <code>tid = threadIdx.z·(Dy·Dx) + threadIdx.y·Dx + threadIdx.x</code>
+&mdash; x varies fastest. So in a 256-thread 1D block, warp 0 is threads 0&ndash;31. In a 16&times;16 block,
+a warp is <b>two adjacent rows of 16</b>. In a 32&times;8 block, a warp is <b>exactly one row of 32</b>.
+This seemingly cosmetic detail decided the 2D convolution's bank-conflict story (chapter 11).</p>
+
+<h2>2.2 Lockstep and its consequences</h2>
+<ul>
+  <li><b>Branching:</b> when lanes of one warp disagree on an <code>if</code>, the hardware runs each
+  side with the other lanes switched off (divergence) — or the compiler avoids branching entirely by
+  <b>predication</b>: every lane executes the instruction, a per-lane flag decides whether the result
+  is kept. Either way the cost of a one-sided <code>if</code> is at most the body once; the real bill is
+  usually the <i>condition evaluation itself</i>, paid by every warp (chapter 11).</li>
+  <li><b>Memory:</b> a warp's 32 loads are issued together, and the hardware merges them into as few
+  memory transactions as possible — this is <i>coalescing</i> (chapter 3).</li>
+  <li><b>Cooperation:</b> lanes can exchange registers directly with shuffle instructions — no memory
+  involved (chapter 6).</li>
+</ul>
+
+<h2>2.3 Latency hiding: why the GPU wants thousands of threads</h2>
+<p>A single load from DRAM takes hundreds of cycles. A CPU hides that with caches and speculation;
+a GPU hides it with <b>other warps</b>: when warp A stalls on a load, the SM instantly switches to
+warp B. The more resident warps an SM has (its <b>occupancy</b>, out of a maximum of 64), the more
+stalls it can paper over. Anything that reduces resident warps — big shared-memory allocations,
+high register counts — reduces the SM's supply of "other work" (chapters 8 and 11 both hinge on this).</p>
+
+<h1><span class="chip">3</span>The memory hierarchy</h1>
+
+<div class="fig">
+<svg width="640" height="260" viewBox="0 0 640 260" font-family="Segoe UI, sans-serif">
+  <g font-size="10">
+    <rect x="200" y="10"  width="240" height="34" fill="#2a78d6" rx="5"/>
+    <text x="320" y="31" text-anchor="middle" fill="#fff" font-weight="600">Registers — per thread</text>
+    <rect x="160" y="52"  width="320" height="34" fill="#5598e7" rx="5"/>
+    <text x="320" y="73" text-anchor="middle" fill="#fff" font-weight="600">Shared memory / L1 — per SM (96 KB pool)</text>
+    <rect x="120" y="94"  width="400" height="34" fill="#86b6ef" rx="5"/>
+    <text x="320" y="115" text-anchor="middle" font-weight="600">L2 cache — chip-wide (1.5 MB)</text>
+    <rect x="80"  y="136" width="480" height="34" fill="#b7d3f6" rx="5"/>
+    <text x="320" y="157" text-anchor="middle" font-weight="600">DRAM ("global memory") — 6 GB</text>
+  </g>
+  <g font-size="8.8" fill="#52514e">
+    <text x="450" y="31" text-anchor="start" dx="4"> fastest, ~0 cycles</text>
+    <text x="490" y="73" text-anchor="start" dx="4"> ~20–30 cycles</text>
+    <text x="530" y="115" text-anchor="start" dx="4"> ~200 cycles</text>
+    <text x="570" y="157" text-anchor="start" dx="4"> ~400+ cycles</text>
+  </g>
+  <g font-size="8.8" fill="#52514e">
+    <text x="190" y="31" text-anchor="end">you (compiler)</text>
+    <text x="150" y="73" text-anchor="end">you (explicit)</text>
+    <text x="110" y="115" text-anchor="end">hardware</text>
+    <text x="70"  y="157" text-anchor="end">hardware</text>
+  </g>
+  <rect x="80" y="186" width="480" height="58" fill="#fff8ec" stroke="#eda100" rx="5"/>
+  <text x="320" y="204" text-anchor="middle" font-size="9.5" font-weight="600" fill="#9a5b00">Special path: constant memory (64 KB) + per-SM constant cache</text>
+  <text x="320" y="220" text-anchor="middle" font-size="8.8" fill="#52514e">superpower = broadcast: if all 32 lanes read the SAME address, one fetch feeds the whole warp,</text>
+  <text x="320" y="234" text-anchor="middle" font-size="8.8" fill="#52514e">and the value can ride inside an FMA as an operand — zero load instructions (chapters 10–11)</text>
+</svg>
+<div class="cap"><b>Figure 3.1</b> — The hierarchy with this card's numbers. Left labels say who manages
+each level. The two levels <i>you</i> control — registers and shared memory — are where every
+optimization in Part II lives.</div>
+</div>
+
+<h2>3.1 Coalescing: the first rule of global memory</h2>
+<p>DRAM is read in 32-byte sectors grouped into 128-byte cache lines. When a warp's 32 lanes load
+4-byte floats from <b>32 consecutive addresses</b>, the whole warp is served by one 128-byte line: perfect.
+When lanes load addresses a full row apart (stride N), the warp needs 32 separate transactions — a
+32&times; traffic amplification for the same useful data. GEMV (chapter 8) measures this exact difference:
+43 vs 151 GB/s.</p>
+
+<div class="fig">
+<svg width="640" height="150" viewBox="0 0 640 150" font-family="Segoe UI, sans-serif">
+  <text x="160" y="16" text-anchor="middle" font-size="10" font-weight="600">Coalesced: lane i → address base+i</text>
+  <g>
+    <rect x="30" y="26" width="260" height="24" fill="#eef4fd" stroke="#2a78d6" rx="3"/>
+    <text x="160" y="42" text-anchor="middle" font-size="8.5" fill="#1c5cab">one 128-byte transaction serves all 32 lanes</text>
+  </g>
+  <g stroke="#2a78d6" stroke-width="1.2">
+    <path d="M60 76 L60 54"/><path d="M110 76 L110 54"/><path d="M160 76 L160 54"/><path d="M210 76 L210 54"/><path d="M260 76 L260 54"/>
+  </g>
+  <g font-size="8.5" fill="#52514e">
+    <text x="60" y="90" text-anchor="middle">lane 0</text><text x="110" y="90" text-anchor="middle">lane 8</text>
+    <text x="160" y="90" text-anchor="middle">lane 16</text><text x="210" y="90" text-anchor="middle">lane 24</text>
+    <text x="260" y="90" text-anchor="middle">lane 31</text>
+  </g>
+  <text x="160" y="118" text-anchor="middle" font-size="9" fill="#0b7a45">✓ 128 useful bytes / 128 fetched</text>
+
+  <text x="480" y="16" text-anchor="middle" font-size="10" font-weight="600">Strided: lane i → address base+i·N</text>
+  <g>
+    <rect x="350" y="26" width="56" height="24" fill="#fdf1ef" stroke="#d03b3b" rx="3"/>
+    <rect x="424" y="26" width="56" height="24" fill="#fdf1ef" stroke="#d03b3b" rx="3"/>
+    <rect x="498" y="26" width="56" height="24" fill="#fdf1ef" stroke="#d03b3b" rx="3"/>
+    <text x="590" y="42" text-anchor="middle" font-size="9" fill="#a52a2a">… ×32</text>
+  </g>
+  <g stroke="#d03b3b" stroke-width="1.2">
+    <path d="M378 76 L378 54"/><path d="M452 76 L452 54"/><path d="M526 76 L526 54"/>
+  </g>
+  <g font-size="8.5" fill="#52514e">
+    <text x="378" y="90" text-anchor="middle">lane 0</text><text x="452" y="90" text-anchor="middle">lane 1</text>
+    <text x="526" y="90" text-anchor="middle">lane 2</text>
+  </g>
+  <text x="480" y="118" text-anchor="middle" font-size="9" fill="#a52a2a">✗ 4 useful bytes / 128 fetched, per lane</text>
+</svg>
+<div class="cap"><b>Figure 3.2</b> — Coalescing. Same 32 floats of useful data; up to 32&times; difference
+in memory traffic. Design the <i>thread-to-data mapping</i> so that consecutive lanes touch consecutive
+addresses.</div>
+</div>
+
+<h2>3.2 Shared memory: a leased scratchpad, not a cache</h2>
+<p>Each SM owns 96 KB of shared memory. When a block launches, it gets an <b>exclusive slice</b>
+sized to its request, held until the block dies; inside the kernel, <code>__shared__</code> arrays live
+in that slice. Three consequences, each learned the hard way:</p>
+<ul>
+  <li><b>It is a purchase, not a free win.</b> Every KB you request is a bid against occupancy:
+  ask for 16 KB/block and only 6 blocks fit per SM (GEMV, chapter 8 — a measured regression).</li>
+  <li><b>It starts as garbage.</b> The previous tenant's data is still there. Every slot your compute
+  loop reads must be written first (convolution halos, chapters 10&ndash;11).</li>
+  <li><b>It is private to the block.</b> No block can read another's slice — cross-block cooperation
+  must round-trip through global memory between kernel launches (scan, chapter 9).</li>
+</ul>
+
+<h2>3.3 Banks: how shared memory is wired</h2>
+<p>Shared memory is divided into <b>32 banks</b>; 4-byte word <i>i</i> lives in bank <i>i</i> mod 32.
+A warp reads at full speed only when its 32 lanes hit 32 <i>different</i> banks (reading the identical
+word is also fine — that's a broadcast). Two lanes on the same bank at different addresses = the access
+runs twice (<b>2-way conflict</b>); a whole warp on one bank runs 32&times; slower. Transpose (chapter 7),
+scan (chapter 9), and conv2d (chapter 11) each hit a different variant of this — and needed three
+different fixes.</p>
+
+<h2>3.4 A Pascal-consumer quirk that shaped chapter 11</h2>
+<div class="warnbox"><span class="kb-t">SM_61 QUIRK</span><br>
+On this card, an <i>ordinary</i> global load never uses the per-SM L1 cache — it always goes to L2.
+The fast L1 path is reserved for the <b>read-only load</b> (<code>LDG.CI</code>), which the compiler may
+only emit when it can prove no thread writes that memory during the kernel. Plain <code>const</code> is
+not proof (the same memory could be written through another pointer). Marking pointers
+<code>const T* __restrict__</code> provides the proof. This single annotation was worth 1.4&times; on
+conv2d.</div>
+
+<h1><span class="chip">4</span>Measuring honestly: rooflines and ratios</h1>
+
+<h2>4.1 The roofline: which ceiling are you under?</h2>
+<p>Every kernel does some arithmetic (FLOPs) and moves some bytes. Its <b>arithmetic intensity</b>
+(AI) is the ratio: useful FLOPs per byte of <i>ideal</i> traffic. The machine imposes two ceilings —
+192 GB/s of memory bandwidth and 3900 GFLOP/s of arithmetic — and which one binds depends on AI.
+The crossover ("ridge") for this card is 3900/192 &asymp; <b>20.3 FLOP/byte</b>.</p>
+
+<div class="fig">
+<svg width="620" height="250" viewBox="0 0 620 250" font-family="Segoe UI, sans-serif">
+  <g stroke="#e1e0d9" stroke-width="1">
+    <line x1="70" y1="30" x2="70" y2="200"/><line x1="70" y1="200" x2="580" y2="200"/>
+  </g>
+  <path d="M70 195 L330 60 L580 60" stroke="#d03b3b" stroke-width="2.2" fill="none"/>
+  <text x="150" y="105" font-size="9" fill="#a52a2a" transform="rotate(-27 150 105)">memory ceiling: AI × 192 GB/s</text>
+  <text x="450" y="52" font-size="9" fill="#a52a2a">compute ceiling: 3900 GFLOP/s</text>
+  <line x1="330" y1="60" x2="330" y2="200" stroke="#c3c2b7" stroke-dasharray="4 3"/>
+  <text x="330" y="216" text-anchor="middle" font-size="9" fill="#52514e">ridge ≈ 20.3 FLOP/B</text>
+  <g>
+    <circle cx="120" cy="176" r="5" fill="#2a78d6"/>
+    <text x="120" y="166" text-anchor="middle" font-size="8.6">dotprod, transpose, scan, conv1d</text>
+    <text x="120" y="192" text-anchor="middle" font-size="8" fill="#52514e">AI &lt; 1: memory-bound</text>
+    <circle cx="430" cy="130" r="5" fill="#2a78d6"/>
+    <text x="430" y="120" text-anchor="middle" font-size="8.6">matmul (AI grows with tile size)</text>
+    <circle cx="330" cy="150" r="5" fill="#eda100" stroke="#9a5b00"/>
+    <text x="330" y="140" text-anchor="middle" font-size="8.6" font-weight="600">conv2d r=4: ON the ridge</text>
+  </g>
+  <text x="40" y="115" font-size="9" fill="#52514e" transform="rotate(-90 40 115)">achievable GFLOP/s (log)</text>
+  <text x="325" y="238" text-anchor="middle" font-size="9" fill="#52514e">arithmetic intensity, FLOP per ideal byte (log)</text>
+</svg>
+<div class="cap"><b>Figure 4.1</b> — The roofline for this card (schematic). Left of the ridge, only
+GB/s matters; right of it, only GFLOP/s. Conv2d at r=4 has AI = 162 FLOPs / 8 bytes &asymp; 20.3 —
+exactly at the ridge, so both numbers are reported and whichever is further from its peak points to
+the slack.</div>
+</div>
+
+<h2>4.2 Effective bandwidth: count ideal traffic, not actual</h2>
+<p>All GB/s figures in these notes are <b>effective</b>: (bytes the kernel <i>logically must</i> move,
+e.g. read input once + write output once) ÷ time. Redundant traffic — halo re-reads, mask fetches,
+uncoalesced amplification — deliberately does not count as useful. That makes effective bandwidth a
+score against the ideal: reaching ~110&ndash;140 GB/s (what this card actually sustains for streaming)
+means the kernel wastes nothing.</p>
+
+<h2>4.3 The measurement discipline</h2>
+<ul>
+  <li><b>Median-of-samples timing</b> (a warm-up, then the median of several timed runs).</li>
+  <li><b>Same-run A/B.</b> Variants are compared inside one program execution — thermal state cancels out.</li>
+  <li><b>Correctness gates perf.</b> Every kernel is checked against a CPU reference first; outputs are
+  poisoned with NaN bytes beforehand so a kernel that writes nothing fails loudly.</li>
+  <li><b>Tests are hardened against lucky symmetry</b> — e.g. the conv2d mask is made asymmetric so a
+  transposed index can't silently pass.</li>
+  <li><b>When profilers fail, improvise:</b> hardware counters are blocked on this Windows setup, so the
+  diagnostics became controlled sweeps (chapter 10) and instruction-census reads of the compiled
+  assembly via <code>cuobjdump -sass</code> (chapter 11).</li>
+</ul>
+
+<h1><span class="chip">5</span>Matrix multiplication — reuse and tiling</h1>
+<p><i>C = A·B, 1024&sup3;-class sizes. Measured: naive ~179&ndash;191 → shared-tiled ~430 →
+register-tiled ~1030&ndash;1044 GFLOP/s (26% of fp32 peak).</i></p>
+
+<h2>5.1 The problem with naive</h2>
+<p>One thread per output element: thread (row, col) walks row of A and column of B, doing 2N FLOPs
+but issuing 2N global loads. Every element of A is re-fetched by a whole row of threads, every element
+of B by a whole column — the data has enormous <b>reuse</b>, and naive throws it all at the caches.
+AI per thread ≈ 0.25 FLOP/byte: deep in memory-bound territory despite matmul being the textbook
+compute-bound problem.</p>
+
+<h2>5.2 Shared-memory tiling: buy reuse explicitly</h2>
+<p>Partition C into 16&times;16 tiles, one block each. The block marches along the shared dimension in
+16-wide steps; at each step it cooperatively loads one 16&times;16 tile of A and one of B into shared
+memory (each thread loads one element of each — coalesced), barriers, then every thread does 16 FMAs
+out of the tiles, barriers again, and moves on:</p>
+
+<pre><code>for (int t = 0; t &lt; numTiles; t++) {
+    Ads[ty][tx] = /* guarded load of A tile element */;
+    Bds[ty][tx] = /* guarded load of B tile element */;
+    __syncthreads();                       // tiles complete before ANY thread reads
+    for (int k = 0; k &lt; TILE_WIDTH; k++)
+        value += Ads[ty][k] * Bds[k][tx];
+    __syncthreads();                       // everyone done reading before next overwrite
+}</code></pre>
+
+<div class="fig">
+<svg width="600" height="190" viewBox="0 0 600 190" font-family="Segoe UI, sans-serif">
+  <g font-size="9" fill="#52514e">
+    <rect x="30" y="40" width="130" height="130" fill="none" stroke="#c3c2b7"/>
+    <rect x="30" y="72" width="130" height="26" fill="#fff8ec" stroke="#eda100"/>
+    <rect x="82" y="72" width="26" height="26" fill="#eda100"/>
+    <text x="95" y="30" text-anchor="middle" font-weight="600" fill="#0b0b0b">A</text>
+    <text x="95" y="184" text-anchor="middle">row strip, tile by tile →</text>
+    <rect x="200" y="40" width="130" height="130" fill="none" stroke="#c3c2b7"/>
+    <rect x="252" y="40" width="26" height="130" fill="#fff8ec" stroke="#eda100"/>
+    <rect x="252" y="72" width="26" height="26" fill="#eda100"/>
+    <text x="265" y="30" text-anchor="middle" font-weight="600" fill="#0b0b0b">B</text>
+    <text x="265" y="184" text-anchor="middle">column strip ↓</text>
+    <rect x="380" y="40" width="130" height="130" fill="none" stroke="#c3c2b7"/>
+    <rect x="432" y="72" width="26" height="26" fill="#2a78d6"/>
+    <text x="445" y="30" text-anchor="middle" font-weight="600" fill="#0b0b0b">C</text>
+    <text x="445" y="184" text-anchor="middle">one 16×16 tile per block</text>
+    <path d="M340 105 L372 105" stroke="#898781" stroke-width="1.5" marker-end="url(#arr2)"/>
+  </g>
+  <defs><marker id="arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#898781"/></marker></defs>
+</svg>
+<div class="cap"><b>Figure 5.1</b> — Tiling. Each orange 16&times;16 tile is loaded from global memory
+<i>once</i> (256 loads) and then read 16 times by each of 256 threads (4096 reads) — a 16&times; reduction
+in global traffic. Bigger tile ⇒ more reuse ⇒ higher arithmetic intensity.</div>
+</div>
+
+<h2>5.3 Register tiling: reuse <i>within</i> a thread</h2>
+<p>Shared memory is fast but still ~20&times; slower than a register. The 2&times;2 register-tiled kernel
+makes each thread compute <b>four</b> outputs (c00, c01, c10, c11). In the inner loop it reads two values
+from the A tile and two from the B tile — 4 shared reads — and performs 4 FMAs: a 2&times; better
+FMA-per-shared-read ratio than the plain tiled kernel, with the accumulators living in registers.</p>
+
+<pre><code>for (int k = 0; k &lt; TILE_WIDTH; k++) {
+    c00 += Ads[ty][k]            * Bds[k][tx];
+    c01 += Ads[ty][k]            * Bds[k][tx + TILE_WIDTH];
+    c10 += Ads[ty + TILE_WIDTH][k] * Bds[k][tx];
+    c11 += Ads[ty + TILE_WIDTH][k] * Bds[k][tx + TILE_WIDTH];
+}</code></pre>
+
+<div class="keybox"><span class="kb-t">LESSONS</span><br>
+(1) Find the reuse in the math, then choose which level of the hierarchy captures it: caches
+(naive — bad), shared memory (tiled — 2.4&times;), registers (register-tiled — another 2.4&times;).
+(2) The double-barrier pattern — load, sync, compute, sync — is the canonical shape of every tiled
+kernel in this repo. (3) At 26% of fp32 peak there is known headroom (double-buffering: prefetch tile
+t+1 while computing on tile t) — a future session.</div>
+
+<h1><span class="chip">6</span>Dot product — reductions and atomics</h1>
+<p><i>N = 16.7M floats. Measured: ~125&ndash;138 GB/s effective (~70% of spec peak, which is the
+practical streaming ceiling). Memory-bound by design.</i></p>
+
+<h2>6.1 Grid-stride loading</h2>
+<p>Launch a bounded grid (≤1024 blocks) and let each thread accumulate many elements:</p>
+<pre><code>for (int i = idx; i &lt; N; i += gridDim.x * blockDim.x)
+    sum += A[i] * B[i];</code></pre>
+<p>Consecutive lanes read consecutive addresses at every step (coalesced), any N is handled without
+grid-size gymnastics, and each thread arrives at the reduction holding one partial sum.</p>
+
+<h2>6.2 The three-stage reduction</h2>
+<p>Summing one value per thread across the whole block:</p>
+<ol>
+  <li><b>Warp level — shuffles.</b> <code>__shfl_down_sync(mask, val, offset)</code> hands lane
+  <i>i</i> the register value of lane <i>i+offset</i>, no memory involved. Halving the offset
+  16→8→4→2→1 folds 32 partials into lane 0 in five steps.</li>
+  <li><b>Block level.</b> Each warp's lane 0 drops its result into a tiny shared array
+  (<code>warpSums[32]</code>); after a barrier, the first warp shuffle-reduces those.</li>
+  <li><b>Grid level — one atomic.</b> Thread 0 of each block does <code>atomicAdd(C, sum)</code>.
+  ≤1024 atomics for 16.7M inputs: contention is irrelevant. (The launcher must zero the accumulator
+  first — a contract worth remembering.)</li>
+</ol>
+
+<div class="fig">
+<svg width="560" height="170" viewBox="0 0 560 170" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <g fill="#2a78d6">
+      <rect x="40" y="20" width="480" height="18" rx="3" fill="#86b6ef"/>
+      <rect x="40" y="50" width="240" height="18" rx="3" fill="#5598e7"/>
+      <rect x="40" y="80" width="120" height="18" rx="3" fill="#3987e5"/>
+      <rect x="40" y="110" width="60" height="18" rx="3" fill="#2a78d6"/>
+      <rect x="40" y="140" width="30" height="18" rx="3" fill="#1c5cab"/>
+    </g>
+    <g fill="#52514e">
+      <text x="530" y="33">32 lanes hold partials</text>
+      <text x="290" y="63">+= lane+16   (offset 16)</text>
+      <text x="170" y="93">+= lane+8</text>
+      <text x="110" y="123">+= lane+4 … 2</text>
+      <text x="80" y="153">lane 0 holds the warp total</text>
+    </g>
+  </g>
+</svg>
+<div class="cap"><b>Figure 6.1</b> — Warp shuffle reduction: log&#8322;32 = 5 register-to-register steps,
+no shared memory, no barrier. This helper was written once and reused verbatim in GEMV.</div>
+</div>
+
+<div class="keybox"><span class="kb-t">LESSONS — INCLUDING TWO NEGATIVE RESULTS</span><br>
+(1) The kernel is memory-bound: the entire reduction (shuffles + one barrier + one atomic) is
+invisible next to streaming 128 MB. (2) <code>float4</code> vectorized loads <b>regressed ~5%</b> —
+coalesced scalar loads already saturate the transaction width on Pascal, and wider loads reduced
+loads-in-flight. (3) 4&times; unrolling was <b>neutral</b>. Optimizations that "obviously help" often
+don't — measure, keep the simple version when it wins.</div>
+
+<h1><span class="chip">7</span>Transpose — coalescing and bank conflicts</h1>
+<p><i>2048&times;4096. Measured: naive ~56&ndash;57 → tiled ~82 → padded ~139 GB/s (~72% of peak).</i></p>
+
+<h2>7.1 The structural problem</h2>
+<p>B[j][i] = A[i][j]. If reads of A are coalesced (consecutive columns), then writes to B are
+column-order — stride-<i>rows</i> apart, uncoalesced. One side must suffer… unless you change the
+data's <i>orientation</i> midway.</p>
+
+<h2>7.2 Staging the swap through shared memory</h2>
+<p>The block loads a 32&times;32 tile row-wise (coalesced reads into <code>tile[ty][tx]</code>),
+barriers, then writes it out <i>reading the tile transposed</i> (<code>tile[tx][ty]</code>) with
+swapped block coordinates — so the global <i>writes</i> are also row-order, coalesced. The transpose
+happens inside shared memory, where "orientation" costs nothing… almost.</p>
+
+<h2>7.3 The bank conflict, and the +1 pad</h2>
+<p>Reading <code>tile[tx][ty]</code> means the warp's 32 lanes read down a <i>column</i>: addresses
+0, 32, 64, … — all congruent mod 32, <b>all in one bank</b>. A 32-way conflict: the read serializes
+32&times;, and tiled only reached 82 GB/s. Declaring <code>tile[32][33]</code> makes the row stride 33,
+coprime with 32 — a column's successive elements now land in banks 0, 1, 2, …: conflict-free. That
+one character (the +1) took the kernel from 82 to 139 GB/s.</p>
+
+<div class="fig">
+<svg width="620" height="180" viewBox="0 0 620 180" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <text x="155" y="16" text-anchor="middle" font-size="10" font-weight="600">tile[32][32] — column read</text>
+    <g>
+      <rect x="55" y="26" width="200" height="110" fill="none" stroke="#c3c2b7"/>
+      <rect x="85" y="26" width="14" height="110" fill="#fdf1ef" stroke="#d03b3b"/>
+      <g fill="#d03b3b"><circle cx="92" cy="36" r="3"/><circle cx="92" cy="58" r="3"/><circle cx="92" cy="80" r="3"/><circle cx="92" cy="102" r="3"/><circle cx="92" cy="124" r="3"/></g>
+    </g>
+    <text x="155" y="152" text-anchor="middle" fill="#a52a2a">addresses 0,32,64,… → ONE bank, 32-way serial</text>
+    <text x="465" y="16" text-anchor="middle" font-size="10" font-weight="600">tile[32][33] — same column read</text>
+    <g>
+      <rect x="365" y="26" width="200" height="110" fill="none" stroke="#c3c2b7"/>
+      <g fill="#2a78d6">
+        <circle cx="395" cy="36" r="3"/><circle cx="401" cy="58" r="3"/><circle cx="407" cy="80" r="3"/><circle cx="413" cy="102" r="3"/><circle cx="419" cy="124" r="3"/>
+      </g>
+      <path d="M395 36 L419 124" stroke="#86b6ef" stroke-width="1" stroke-dasharray="3 2"/>
+    </g>
+    <text x="465" y="152" text-anchor="middle" fill="#1c5cab">stride 33 ⊥ 32 banks → each element a new bank</text>
+  </g>
+</svg>
+<div class="cap"><b>Figure 7.1</b> — The padding trick. With row stride 32, a column lives entirely in
+one bank (left). Stride 33 is coprime with the 32 banks, so the column "drifts" diagonally across all
+of them (right). Cost: 32 wasted words per tile. Gain: 1.7&times;.</div>
+</div>
+
+<div class="keybox"><span class="kb-t">LESSONS</span><br>
+(1) When a kernel's two sides want incompatible access orders, stage through shared memory and give
+<i>each</i> side its preferred order. (2) Bank conflicts are invisible in code and enormous in effect —
+reason about <i>addresses mod 32</i> whenever a warp's shared accesses are strided. (3) The coprime-stride
+pad recurs: <code>[TILE][TILE+1]</code> here, <code>i + (i&gt;&gt;5)</code> in scan.</div>
+
+<h1><span class="chip">8</span>GEMV — access patterns, and a negative result</h1>
+<p><i>y = A·x, 4096&times;4096. Measured: naive ~31&ndash;43 → warp-per-row ~151 GB/s (~79% of peak) →
+warp-per-row + shared-x ~120&ndash;130 GB/s (a deliberate, kept regression).</i></p>
+
+<h2>8.1 Thread-per-row vs warp-per-row</h2>
+<p>The naive mapping gives each <i>thread</i> a row. Look at it from the warp's perspective: at step
+i, lane 0 reads A[0][i], lane 1 reads A[1][i] — addresses a full row (16 KB) apart. Stride-N,
+uncoalesced, ~32&times; traffic amplification (Figure 3.2 in the flesh). The fix is to flip the mapping:
+give each <b>warp</b> a row. Lane <i>l</i> strides the columns by 32 — consecutive lanes, consecutive
+addresses, one transaction — and a warp shuffle collapses the 32 partials:</p>
+<pre><code>for (int i = lane; i &lt; N; i += 32)
+    sum += A[wid * N + i] * x[i];
+sum = warpReduceSum(sum);
+if (lane == 0) y[wid] = sum;</code></pre>
+<p>43 → 151 GB/s. Nothing about the arithmetic changed — only <i>who reads what</i>.</p>
+
+<h2>8.2 The shared-x experiment: a negative result worth keeping</h2>
+<p>Every row reads the same x (16 KB). Hypothesis: stage x in shared memory once per block. Measured:
+<b>15&ndash;20% slower</b>. Two stacked reasons:</p>
+<ol>
+  <li><b>L2 already had it.</b> x is re-read by all 4096 rows, so after first touch it lives in the
+  1.5 MB chip-wide L2. The staging loop's reads hit L2 anyway — zero DRAM traffic saved — while adding
+  4096 loads, 4096 shared stores, and a barrier to every block.</li>
+  <li><b>Occupancy collapse.</b> 16 KB/block means ⌊96/16⌋ = 6 blocks/SM instead of 16: resident
+  warps fell 64 → 24 (100% → 37.5%), leaving the SM too few warps to hide A's load latency.</li>
+</ol>
+<div class="keybox"><span class="kb-t">THE RULE THIS BOUGHT</span><br>
+Shared memory is a <i>purchase</i>: you pay in occupancy and staging work, and the return is
+(reuse count) &times; (per-access saving vs where the data would otherwise live). If the data already
+lives in L2, the saving is nearly zero and the purchase is a loss. Matmul tiles and convolution halos
+pay off; a small read-only vector does not. Before staging anything, ask: <b>where would the caches
+put this anyway?</b></div>
+
+<h1><span class="chip">9</span>Scan — dependencies, trees, and barriers</h1>
+<p><i>Inclusive prefix sum, N = 1M. Measured: 3-pass Hillis-Steele ~0.27 ms → Blelloch pass 1
+~0.27 ms (1.07&times;) → Blelloch + padded indexing ~0.19 ms (<b>1.45&ndash;1.7&times;</b>, the number to trust
+is the same-run ratio).</i></p>
+
+<h2>9.1 Why scan is different</h2>
+<p>Everything before this chapter was embarrassingly parallel: out[i] depended only on in[i] and
+neighbors. Scan's out[i] = x[0]+…+x[i] depends on <i>everything before it</i>. Parallelizing it means
+restructuring the arithmetic into a tree — and coordinating across blocks, which have no way to talk
+to each other during a launch.</p>
+
+<h2>9.2 Two single-block algorithms</h2>
+<p><b>Hillis-Steele</b> (inclusive): for d = 1, 2, 4, …: every thread does
+<code>s[tid] += s[tid−d]</code> (register-buffered with two barriers per level to avoid the in-place
+race). log&#8322;N levels, but N adds per level: <b>O(N log N) total work</b>, dead simple.</p>
+<p><b>Blelloch</b> (exclusive, work-efficient): two elements per thread. An <b>up-sweep</b> builds a
+sum tree in place (strides doubling 1, 2, 4, …), then the root is cleared to 0 and a <b>down-sweep</b>
+walks back down (strides halving), each node doing swap-and-add:</p>
+<pre><code>// up-sweep level (stride = offset):        // down-sweep level:
+int l = offset*(2*tid + 1) - 1;             float t = s[l];
+int r = offset*(2*tid + 2) - 1;             s[l] = s[r];
+s[r] += s[l];                               s[r] += t;</code></pre>
+<p>Total work O(N) — asymptotically better. Hold that thought.</p>
+
+<h2>9.3 Multi-block: the 3-pass structure</h2>
+<p>Blocks can't see each other's shared memory, and the only grid-wide synchronization is a kernel
+boundary. So: <b>pass 1</b> — each block scans its 1024-chunk and writes its chunk total;
+<b>pass 2</b> — one block exclusive-scans the totals into per-chunk offsets;
+<b>pass 3</b> — every element adds its chunk's offset. Three launches, global memory as the mailbox.</p>
+
+<h2>9.4 The two optimizations, and the upset</h2>
+<p>Profiling showed pass 1 taking ~80% of runtime at ~26 GB/s while pass 3 — same data volume, no
+barriers — ran at ~117 GB/s. Pass 1 was <b>barrier-bound</b>, not memory-bound. Two candidate fixes:</p>
+<table>
+  <tr><th>Fix</th><th>Theory says</th><th>Wall clock says</th></tr>
+  <tr><td>Blelloch (O(N) work instead of O(N log N))</td><td>huge</td><td class="num"><b>1.07&times;</b></td></tr>
+  <tr><td>Pad shared indices <code>i → i + (i&gt;&gt;5)</code></td><td>footnote</td><td class="num"><b>1.7&times;</b></td></tr>
+</table>
+<p>Why: both algorithms hit ~20 barriers per block, and barriers dominated — so cutting <i>work</i>
+barely moved anything. But Blelloch's power-of-two strides are bank-conflict machines: at stride 32,
+a whole warp lands in one bank (32-way serial). One pad word every 32 real words (the 1-D cousin of
+the transpose +1 pad) removed the conflicts and delivered 10&times; more speedup than the
+asymptotic improvement.</p>
+
+<div class="keybox"><span class="kb-t">LESSONS</span><br>
+(1) Kernel boundaries are the only cheap grid-wide sync; design multi-block algorithms as passes.
+(2) Big-O counts operations; the GPU bills for <i>barriers and bank conflicts</i>. Profile before
+trusting asymptotics. (3) Same-run A/B ratios are the only trustworthy currency on thermally drifting
+hardware. Known headroom: stride-2 loads and pass-3 fusion (decoupled lookback).</div>
+
+<h1><span class="chip">10</span>1D convolution — constant memory and halos</h1>
+<p><i>N = 16.7M, radius r = 4 (9 taps), zero-padded. Measured: naive ~29 → const-mask ~72&ndash;82 →
+tiled ~77&ndash;87 → tiled+unrolled ~104&ndash;112 GB/s — which IS the streaming floor: done in the
+strongest sense.</i></p>
+
+<h2>10.1 The stencil pattern</h2>
+<p>out[i] = &Sigma;<sub>j=−r..r</sub> in[i+j]·mask[j+r]. Every input is reused by 2r+1 = 9 outputs;
+every thread reads the same 9-float mask. Two reuse structures, two tools.</p>
+
+<h2>10.2 Constant memory: the broadcast path (2.8&times;)</h2>
+<p>The mask index <code>j+r</code> depends on the loop counter, not on threadIdx — all 32 lanes read
+the <b>same address</b> every iteration. That is exactly what <code>__constant__</code> memory's
+per-SM cache is built for: one fetch broadcasts to the whole warp, and the compiler folds the value
+into the FMA as a direct operand — no load instruction at all. Moving the mask from a plain pointer
+to <code>c_mask1d</code> tripled throughput, not because 36 bytes were far away (they sat in L2 either
+way) but because it deleted 9 of 18 load instructions and 9 L2 round-trips per output.
+<i>Anti-pattern for contrast: indexing <code>__constant__</code> by threadIdx makes lane addresses
+diverge and the reads serialize.</i></p>
+
+<h2>10.3 Tiling with a halo</h2>
+<p>A block computing outputs [B, B+256) needs inputs [B−4, B+256+4): its range plus <b>r extra on
+each side — the halo</b>, shared with neighbor blocks. The tile (256+2r floats) is loaded
+cooperatively with a stride loop, out-of-range slots getting 0.0f — which bakes the boundary handling
+into the data and leaves the compute loop with <i>no bounds checks</i>:</p>
+<pre><code>for (int s = threadIdx.x; s &lt; tileSize; s += blockDim.x)
+    tile[s] = (inRange(g)) ? in[g] : 0.0f;      // g = blockStart - r + s
+__syncthreads();
+for (int j = -r; j &lt;= r; j++)
+    sum += c_mask1d[j + r] * tile[r + threadIdx.x + j];</code></pre>
+
+<div class="fig">
+<svg width="620" height="120" viewBox="0 0 620 120" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <rect x="30" y="30" width="560" height="22" fill="none" stroke="#c3c2b7"/>
+    <rect x="200" y="30" width="180" height="22" fill="#d6e6ff" stroke="#2a78d6"/>
+    <rect x="176" y="30" width="24" height="22" fill="#ffe7c2" stroke="#eda100"/>
+    <rect x="380" y="30" width="24" height="22" fill="#ffe7c2" stroke="#eda100"/>
+    <text x="290" y="24" text-anchor="middle" fill="#1c5cab" font-weight="600">block's 256 outputs</text>
+    <text x="188" y="70" text-anchor="middle" fill="#9a5b00">halo r</text>
+    <text x="392" y="70" text-anchor="middle" fill="#9a5b00">halo r</text>
+    <text x="110" y="45" text-anchor="middle" fill="#898781">neighbor block's data</text>
+    <text x="490" y="45" text-anchor="middle" fill="#898781">neighbor block's data</text>
+    <path d="M176 84 L404 84" stroke="#2a78d6" stroke-width="1.5"/>
+    <text x="290" y="100" text-anchor="middle" fill="#1c5cab">shared tile = 256 + 2r floats, loaded once, read 9× each</text>
+  </g>
+</svg>
+<div class="cap"><b>Figure 10.1</b> — The halo. Orange cells are inputs the block needs but whose
+outputs belong to neighbors; adjacent blocks each load their own copy. Zero padding is written into
+the tile at load time, so boundary logic vanishes from the hot loop.</div>
+</div>
+
+<h2>10.4 The radius sweep: time = floor + taps &times; price</h2>
+<p>With hardware counters unavailable, a controlled experiment replaced the profiler: run every
+variant at r = 1, 2, 4, 8 and regress time against tap count. Every variant shares one intercept —
+the <b>~1.2 ms streaming floor</b> (128 MB at the card's real ~110 GB/s) — and differs only in the
+<b>per-tap price, set by where that tap's operands live</b>:</p>
+<table>
+  <tr><th>Variant</th><th>Per-tap price</th><th>Why</th></tr>
+  <tr><td>naive</td><td class="num">~0.45 ms/tap</td><td>two L2 trips (input + mask)</td></tr>
+  <tr><td>const-mask</td><td class="num">~0.10 ms/tap</td><td>one L2 trip (mask is free broadcast)</td></tr>
+  <tr><td>tiled / unrolled</td><td class="num">~0.04 ms/tap</td><td>shared memory</td></tr>
+</table>
+<p>The table also exposes the <b>crossover</b>: tiling has a fixed cost (tile load + barrier), so
+const wins for r ≤ 2 and tiled only pays from r ≈ 4 — shared memory purchased with too little reuse
+is the GEMV lesson again, in miniature.</p>
+
+<h2>10.5 Compile-time radius: <code>template &lt;int R&gt;</code></h2>
+<p>A runtime-r loop can't unroll: the compiler must keep the counter, compare, and branch, and can't
+batch the loads. Making the radius a template parameter stamps out one kernel per radius
+(dispatched by a <code>switch</code>, generic fallback for odd radii); <code>#pragma unroll</code> then
+flattens the 9 taps into straight-line code with all loads in flight together — <b>1.4&times;</b> over
+generic tiled, landing on the streaming floor: time flat from 3 to 9 taps.</p>
+
+<div class="keybox"><span class="kb-t">LESSONS</span><br>
+(1) Warp-uniform reads belong in constant memory; the win is broadcast + operand folding, not
+proximity. (2) The halo pattern: over-fetch by r per side, zero-fill at load, compute check-free.
+(3) A parameter sweep can decompose runtime into physically meaningful pieces (floor + per-tap price)
+— a poor man's profiler that's sometimes better than the real one. (4) Values known at compile time
+are optimization fuel; templates are how you feed them to the compiler.</div>
+
+<h1><span class="chip">11</span>2D convolution — the ladder of walls</h1>
+<p><i>4096&times;4096 image, 9&times;9 mask (r = 4, 81 taps), zero-padded. Measured:
+const-mask 15.0 → +__restrict__ 10.6 → shared-tiled (32&times;8) 8.4 → template-unrolled
+<b>3.6&ndash;3.9 ms</b> (up to ~37 GB/s effective / ~750 GFLOP/s). AI &asymp; 20 FLOP/B — exactly the
+roofline ridge, so both scoreboard numbers matter.</i></p>
+
+<p>This chapter is the capstone: four optimizations, and the defining feature of the session was that
+<b>each wall was invisible until the previous one fell</b>. Three predictions missed before one landed —
+and each miss identified a wall nobody had priced in.</p>
+
+<div class="fig">
+<svg width="600" height="210" viewBox="0 0 600 210" font-family="Segoe UI, sans-serif">
+  <g font-size="9">
+    <line x1="60" y1="180" x2="580" y2="180" stroke="#c3c2b7"/>
+    <rect x="80"  y="30"  width="90" height="150" fill="#2a78d6" rx="3"/>
+    <rect x="205" y="74"  width="90" height="106" fill="#2a78d6" rx="3"/>
+    <rect x="330" y="96"  width="90" height="84"  fill="#2a78d6" rx="3"/>
+    <rect x="455" y="141" width="90" height="39"  fill="#2a78d6" rx="3"/>
+    <g fill="#0b0b0b" font-weight="600" font-size="10">
+      <text x="125" y="22" text-anchor="middle">15.0 ms</text>
+      <text x="250" y="66" text-anchor="middle">10.6 ms</text>
+      <text x="375" y="88" text-anchor="middle">8.4 ms</text>
+      <text x="500" y="133" text-anchor="middle">3.9 ms</text>
+    </g>
+    <g fill="#52514e" font-size="8.3">
+      <text x="125" y="194" text-anchor="middle">D: const mask</text>
+      <text x="250" y="194" text-anchor="middle">+ __restrict__</text>
+      <text x="375" y="194" text-anchor="middle">E: smem tile 32×8</text>
+      <text x="500" y="194" text-anchor="middle">F₂: template&lt;R&gt; unroll</text>
+      <text x="125" y="206" text-anchor="middle">wall: L2-only loads</text>
+      <text x="250" y="206" text-anchor="middle">wall: bounds-check tax</text>
+      <text x="375" y="206" text-anchor="middle">wall: runtime-r bookkeeping</text>
+      <text x="500" y="206" text-anchor="middle">wall now: the smem pipe</text>
+    </g>
+  </g>
+</svg>
+<div class="cap"><b>Figure 11.1</b> — The ladder. Under each bar: the wall that <i>capped</i> it, i.e.
+what the next step had to remove. 3.9&times; total; the final kernel spends ~75% of its time feeding the
+shared-memory pipe, which is the honest definition of "the tile is doing its job."</div>
+</div>
+
+<h2>11.1 What changes in 2D</h2>
+<p>Kernel D is 1D-const in two dimensions: a 2D grid, one thread per pixel, two nested tap loops,
+per-component bounds checks, mask from constant memory. The geometry, though, changes the memory story:</p>
+<ul>
+  <li><b>Reuse explodes:</b> each input pixel feeds (2r+1)&sup2; = 81 outputs, not 9.</li>
+  <li><b>A warp's row-taps are nearly free:</b> its 9 horizontal taps span ~2 cache lines — same-line
+  rereads.</li>
+  <li><b>Its column-taps are not:</b> vertically adjacent pixels are W·4 = 16 KB apart — 9 distinct
+  lines, and the reuse partners are different warps in different blocks, scheduled whenever.</li>
+</ul>
+
+<h2>11.2 Step 1 — <code>__restrict__</code> and the read-only path (15.0 → 10.6 ms)</h2>
+<p>Measured D was 3&times; worse than the pessimistic prediction. Diagnosis: the sm_61 quirk of
+&sect;3.4 — plain loads all went to L2. Estimated L2 traffic (~5.4 GB over 15 ms &asymp; 370 GB/s) said the
+kernel was saturating <i>L2 bandwidth</i> while DRAM idled at 9 GB/s: a bottleneck one level above
+the one everyone watches. <code>const float* __restrict__ in, float* __restrict__ out</code> is the
+programmer's signed promise that the pointers don't alias — which the compiler needs because "could a
+load observe a write?" is a question about <i>all 16.7M concurrent threads</i>, not one thread's
+program order. With the promise, loads compile to <code>LDG.E.CI</code> (read-only path through the
+per-SM cache) — verified by dumping the assembly. The promise costs nothing here: in-place
+convolution was already a race.</p>
+
+<h2>11.3 Interlude — does the bounds check diverge?</h2>
+<p>Mostly no, and the reason reframes what an <code>if</code> costs. A 16&times;16 block's warp covers
+2 rows &times; 16 columns; only blocks touching an image edge (~1.6% of 65,536 blocks) ever produce
+lanes that disagree on the bounds test. More fundamentally, the compiler compiled the guarded body
+with <b>predication</b> — compare into a per-lane flag, then <code>@!P3 LDG</code>, <code>@!P3 FFMA</code>:
+no branch exists, so nothing can diverge; off-lanes simply discard results. The real cost was counted
+in the assembly: <b>~10 instructions per tap, only 1 of them the FMA</b> — 3&ndash;4 of them evaluating a
+condition whose answer is "in bounds" for 98.4% of warps. Ask two separate questions of any kernel
+<code>if</code>: do lanes <i>within a warp</i> disagree often? and what does evaluating the condition
+cost when everyone agrees? The second is usually the bill.</p>
+
+<h2>11.4 Step 2 — the halo-ring tile (10.6 → 8.4 ms)</h2>
+<p>Kernel E extends the 1D halo to a ring: a block computing a TILE<sub>x</sub>&times;TILE<sub>y</sub>
+pixel patch stages (TILE<sub>x</sub>+2r)(TILE<sub>y</sub>+2r) inputs in shared memory. Two mapping
+problems are new in 2D:</p>
+<p><b>Loading (flatten-and-stride):</b> 256 threads must fill 640 slots — no 1:1 assignment exists.
+Number the slots 0..639 row-major; thread t fills slots t, t+256, t+512; each slot unflattens by
+dividing by the <b>row width</b> (slot s → row s/side, col s%side) and maps to a global pixel offset
+by (−r, −r) from the block's corner. Out-of-image slots get 0.0f — padding baked in, exactly as in 1D.
+Consecutive slots are consecutive columns: coalesced.</p>
+<p><b>Computing:</b> because the tile starts r up-and-left of the output patch, thread (ty,tx)'s
+window is simply tile rows ty..ty+2r, cols tx..tx+2r — the window's top-left corner IS (ty,tx), no
++r shifts. The classic bug: the tile's row stride is <i>side</i> = TILE<sub>x</sub>+2r, not
+TILE<sub>x</sub>, and not W — the wrong stride produces smooth, plausible, wrong-everywhere output,
+which is what the odd-size (333&times;479) test cases exist to catch.</p>
+
+<div class="fig">
+<svg width="640" height="230" viewBox="0 0 640 230" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <g>
+      <rect x="40" y="40" width="180" height="150" fill="none" stroke="#c3c2b7"/>
+      <rect x="70" y="65" width="120" height="100" fill="#ffe7c2" stroke="#eda100"/>
+      <rect x="85" y="78" width="90" height="74" fill="#d6e6ff" stroke="#2a78d6"/>
+      <text x="130" y="30" text-anchor="middle" font-size="10" font-weight="600">image (global memory)</text>
+      <text x="130" y="118" text-anchor="middle" fill="#1c5cab" font-weight="600">output patch</text>
+      <text x="130" y="180" text-anchor="middle" fill="#9a5b00">halo ring, width r</text>
+    </g>
+    <path d="M235 115 L275 115" stroke="#898781" stroke-width="1.5" marker-end="url(#arr3)"/>
+    <text x="255" y="105" text-anchor="middle" fill="#52514e">load once</text>
+    <g>
+      <rect x="290" y="55" width="150" height="120" fill="#f7f8fa" stroke="#2a78d6"/>
+      <rect x="290" y="55" width="150" height="40" fill="#d6e6ff"/>
+      <rect x="290" y="95" width="150" height="40" fill="#d6f3df"/>
+      <rect x="290" y="135" width="150" height="40" fill="#ffe7c2"/>
+      <text x="365" y="45" text-anchor="middle" font-size="10" font-weight="600">shared tile, flat slots</text>
+      <text x="365" y="79" text-anchor="middle" fill="#1c5cab">pass 1: slots t</text>
+      <text x="365" y="119" text-anchor="middle" fill="#1e7a3d">pass 2: slots t+256</text>
+      <text x="365" y="159" text-anchor="middle" fill="#9a5b00">pass 3: t+512 (partial)</text>
+    </g>
+    <path d="M455 115 L495 115" stroke="#898781" stroke-width="1.5" marker-end="url(#arr3)"/>
+    <text x="475" y="105" text-anchor="middle" fill="#52514e">barrier</text>
+    <g>
+      <rect x="510" y="55" width="110" height="120" fill="none" stroke="#c3c2b7"/>
+      <rect x="524" y="69" width="54" height="54" fill="none" stroke="#2a78d6" stroke-width="2"/>
+      <circle cx="551" cy="96" r="4" fill="#2a78d6"/>
+      <text x="565" y="45" text-anchor="middle" font-size="10" font-weight="600">compute</text>
+      <text x="565" y="192" text-anchor="middle" fill="#52514e">window top-left = (ty,tx)</text>
+      <text x="565" y="205" text-anchor="middle" fill="#52514e">stride = side, NOT TILE</text>
+    </g>
+  </g>
+  <defs><marker id="arr3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#898781"/></marker></defs>
+</svg>
+<div class="cap"><b>Figure 11.2</b> — Kernel E. Global reads drop from 81 to 2.25&ndash;2.5 per pixel
+(the tile, incl. halo, over the outputs). Threads whose pixel is outside the image must still load and
+still reach the barrier — only the final write is guarded. Interactive version:
+<code>docs/conv2d_halo_tiling_viz.html</code>.</div>
+</div>
+
+<h2>11.5 Interlude — warp shape vs the banks</h2>
+<p>With a 16&times;16 block, a warp is two rows of 16. During any tap, lanes 0&ndash;15 read 16
+consecutive tile words at some address A, lanes 16&ndash;31 read 16 consecutive words at A+side.
+With side = 24: banks A..A+15 and (A+24..A+39) mod 32 — lanes 24&ndash;31 wrap onto the banks of
+lanes 0&ndash;7. <b>A 2-way conflict on every shared read.</b> Padding cannot fix this one — any
+usable stride still overlaps two 16-wide segments — because the problem is the <i>shape of the
+warp</i>, not the stride. The fix is geometric: <b>32&times;8 blocks</b> put each warp on a single tile
+row — 32 consecutive words, 32 distinct banks, conflict-free by construction.</p>
+
+<div class="fig">
+<svg width="640" height="170" viewBox="0 0 640 170" font-family="Segoe UI, sans-serif">
+  <g font-size="8.5">
+    <text x="160" y="16" text-anchor="middle" font-size="10" font-weight="600">16×16 block: warp = 2 rows of 16</text>
+    <rect x="40" y="28" width="240" height="26" fill="#d6e6ff" stroke="#2a78d6"/>
+    <text x="160" y="45" text-anchor="middle">lanes 0–15 → banks a … a+15</text>
+    <rect x="76" y="62" width="240" height="26" fill="#fdf1ef" stroke="#d03b3b"/>
+    <text x="196" y="79" text-anchor="middle">lanes 16–31 → banks a+24 … a+31, a … a+7</text>
+    <path d="M100 54 L100 62 M136 54 L136 62" stroke="#d03b3b" stroke-width="1.5"/>
+    <text x="160" y="110" text-anchor="middle" fill="#a52a2a">8 lanes collide with lanes 0–7:</text>
+    <text x="160" y="123" text-anchor="middle" fill="#a52a2a">2-way conflict, every read, all 81 taps</text>
+    <text x="480" y="16" text-anchor="middle" font-size="10" font-weight="600">32×8 block: warp = 1 row of 32</text>
+    <rect x="360" y="28" width="240" height="26" fill="#d6e6ff" stroke="#2a78d6"/>
+    <text x="480" y="45" text-anchor="middle">lanes 0–31 → 32 consecutive words</text>
+    <text x="480" y="110" text-anchor="middle" fill="#1c5cab">32 distinct banks — conflict-free</text>
+    <text x="480" y="123" text-anchor="middle" fill="#1c5cab">by construction, any stride</text>
+  </g>
+  <g font-size="8.8" fill="#52514e">
+    <text x="160" y="152" text-anchor="middle">fix is NOT padding…</text>
+    <text x="480" y="152" text-anchor="middle">…it is block shape</text>
+  </g>
+</svg>
+<div class="cap"><b>Figure 11.3</b> — Same 256 threads, different shape. Transpose's conflict came from
+a strided access pattern (pad fixes it); this one comes from the warp straddling two short rows
+(reshape fixes it). Diagnose <i>which kind</i> you have before reaching for the familiar fix.</div>
+</div>
+
+<p><b>The honest twist:</b> making this fix measured <b>zero</b> improvement at the 8.4 ms stage —
+the conflict's cost sat in the shared-memory pipe, <i>below</i> the instruction-issue wall that was
+actually binding. A bottleneck fixed below the waterline doesn't move the boat. It became load-bearing
+one step later.</p>
+
+<h2>11.6 Step 3 — <code>template &lt;int R&gt;</code> (8.4 → 3.9 ms)</h2>
+<p>Reading the compiled generic kernel explained the cap: with runtime r, the compiler had emitted a
+beautiful 16-taps-at-a-time inner loop — <i>guarded by "only if &gt;12 taps remain in the row"</i>.
+Rows have 9 taps: the fast path was dead code, every row ran remainder loops with per-row address
+setup, and each tap needed an indexed constant-memory load (<code>LDC</code>) for its mask weight
+(~4&ndash;5 instructions and <i>two</i> load-pipe operations per tap). With R compile-time and both tap
+loops unrolled, the mask index becomes a constant per tap and the weight rides <i>inside</i> the FMA:</p>
+<pre><code>FFMA R4, R5, c[0x3][0x4], R4     // mask weight = constant operand: no load instruction</code></pre>
+<p>Instruction census of the compiled R=4 kernel: <b>exactly 81 LDS + 81 FFMA</b> per pixel — two
+instructions per tap, zero mask loads, zero loop bookkeeping. The remaining time (~3 ms of the 3.9) is
+the shared-memory pipe itself at one warp-load per cycle per SM — and <i>this</i> is where the 32&times;8
+reshape pays: with square blocks that pipe would run at half speed (~6 ms floor).</p>
+
+<div class="keybox"><span class="kb-t">LESSONS</span><br>
+(1) Walls fall one at a time, and each is invisible until the previous one falls — so predictions
+will miss, and the misses are the diagnosis. (2) On sm_61, <code>__restrict__</code> is (nearly) free
+performance whenever overlap would already be a bug. (3) An <code>if</code>'s bill is usually condition
+evaluation, not divergence. (4) Bank conflicts have two species — stride (pad it) and warp-shape
+(reshape it). (5) An optimization can be correct and premature: measure zero, keep it anyway if the
+roadmap says the wall it removes is coming. (6) <code>cuobjdump -sass</code> + counting instructions is
+a profiler that can't be permission-blocked. Known headroom: register reuse — one thread computing
+several neighboring outputs whose windows overlap 8/9 (the matmul register-tiling idea, stencil form).</div>
+
+<h1><span class="chip">12</span>Cross-cutting principles</h1>
+<p>The rules that survived contact with seven kernels. Each cites the chapter where it was paid for.</p>
+<ol class="lessonlist">
+  <li><b>Think in warps, not threads.</b> Coalescing (3, 8), shuffles (6), divergence and predication
+  (11), bank conflicts (7, 9, 11) — every one is a warp-level effect. The thread is the programming
+  abstraction; the warp is the machine.</li>
+  <li><b>Design the thread-to-data mapping first.</b> The single biggest jumps in the whole project —
+  GEMV 43→151 GB/s, transpose 56→139 — came from changing <i>who touches what</i>, not from adding
+  hardware features.</li>
+  <li><b>Find the reuse, then choose its home.</b> Caches (free, unreliable), constant cache
+  (warp-uniform reads only), shared memory (explicit, leased), registers (fastest, per-thread).
+  Matmul climbed exactly this ladder (5); conv climbed it again (10&ndash;11).</li>
+  <li><b>Shared memory is a purchase.</b> Price: occupancy + staging + a barrier. Return: reuse &times;
+  per-access saving vs where the data would otherwise live. GEMV shared-x (8) is the canonical loss;
+  conv tiles are the canonical win; conv1d's r≤2 crossover (10) is the break-even point measured.</li>
+  <li><b>Barriers and bank conflicts outrank Big-O.</b> Work-efficient Blelloch bought 1.07&times;;
+  removing bank conflicts bought 1.7&times; (9). Asymptotics count operations; the hardware bills
+  synchronization and serialization.</li>
+  <li><b>Bounds checks cost issue slots, not divergence.</b> Predication means the <code>if</code> runs
+  everywhere; ~40% of kernel D's instructions were computing "yes, in bounds" (11). Delete checks
+  structurally (bake padding into data) rather than optimizing them.</li>
+  <li><b>Give the compiler compile-time facts.</b> Runtime parameters block unrolling, constant-operand
+  folding, and strength reduction. <code>template&lt;int R&gt;</code> + switch dispatch turned 10
+  instructions/tap into 2 (10, 11).</li>
+  <li><b>Walls fall one at a time.</b> An optimization below the binding wall measures zero (the 32&times;8
+  reshape, 11.5) — that is not evidence it's wrong, only that it's early. Re-measure after each wall falls.</li>
+  <li><b>Trust ratios, not absolutes; A/B in the same run.</b> Laptop clocks drift ±10&ndash;50% (1, 9).
+  Correctness first, always: NaN-poisoned outputs, odd sizes, asymmetric masks (4).</li>
+  <li><b>Negative results are results.</b> float4 regressed (6), unrolling was neutral (6), shared-x
+  regressed (8), work-efficiency underwhelmed (9), the reshape measured zero (11). Each is recorded
+  with its reason — collectively they're worth more than the wins.</li>
+  <li><b>When the profiler is locked, improvise instruments:</b> parameter sweeps that decompose time
+  into floor + slope (10); <code>cuobjdump -sass</code> instruction censuses (11); designed A/B pairs
+  that isolate one variable (9, 11).</li>
+</ol>
+
+<h1><span class="chip">13</span>Results and glossary</h1>
+
+<h2>13.1 All measured results</h2>
+<table>
+  <tr><th>Kernel</th><th>Size</th><th>Variant ladder</th><th>Result</th></tr>
+  <tr><td>matmul</td><td>1024-class</td><td>naive → shared-tiled → register-tiled 2&times;2</td>
+      <td class="num">~179 → ~430 → ~1044 GFLOP/s</td></tr>
+  <tr><td>dotprod</td><td>16.7M</td><td>grid-stride + shuffle/block reduction + atomic</td>
+      <td class="num">~125&ndash;138 GB/s</td></tr>
+  <tr><td>transpose</td><td>2048&times;4096</td><td>naive → tiled → padded [32][33]</td>
+      <td class="num">~56 → ~82 → ~139 GB/s</td></tr>
+  <tr><td>GEMV</td><td>4096&sup2;</td><td>naive → warp-per-row → +shared-x (regression)</td>
+      <td class="num">~43 → ~151 → ~130 GB/s</td></tr>
+  <tr><td>scan</td><td>1M</td><td>3-pass; HS → Blelloch → +padded indexing</td>
+      <td class="num">pass-1 ratio 1.0 → 1.07 → ~1.7&times;</td></tr>
+  <tr><td>conv1d</td><td>16.7M, r=4</td><td>naive → const → tiled → template-unrolled</td>
+      <td class="num">~29 → ~82 → ~87 → ~112 GB/s (floor)</td></tr>
+  <tr><td>conv2d</td><td>4096&sup2;, r=4</td><td>const → +__restrict__ → tiled 32&times;8 → template-unrolled</td>
+      <td class="num">15.0 → 10.6 → 8.4 → 3.9 ms (~750 GFLOP/s)</td></tr>
+</table>
+
+<div class="fig">
+  <img src="../perf.png" alt="Measured kernel throughput chart" style="max-width: 92%;">
+  <div class="cap"><b>Figure 13.1</b> — The project scoreboard (<code>docs/perf.png</code>), regenerated
+  after every session by <code>scripts/plot_perf.py</code>, which runs every test binary and refuses to
+  plot if any correctness check fails.</div>
+</div>
+
+<h2>13.2 Glossary</h2>
+<table class="glos">
+  <tr><th>Term</th><th>Meaning</th></tr>
+  <tr><td>warp / lane</td><td>32 threads executing one instruction in lockstep / one thread's position (0&ndash;31) in it</td></tr>
+  <tr><td>coalescing</td><td>hardware merging a warp's 32 loads into few 128-byte transactions; needs consecutive addresses</td></tr>
+  <tr><td>occupancy</td><td>resident warps per SM ÷ 64; the SM's supply of "other work" for hiding latency</td></tr>
+  <tr><td>bank / bank conflict</td><td>shared memory is 32 banks (word i → bank i mod 32); two lanes, same bank, different words = serialized</td></tr>
+  <tr><td>divergence</td><td>lanes of one warp taking different branch paths; each path runs with the others masked off</td></tr>
+  <tr><td>predication</td><td>branchless <code>if</code>: every lane executes, a per-lane flag (<code>@!P3</code>) discards unwanted results</td></tr>
+  <tr><td>halo (ghost cells)</td><td>the extra r-wide border of input a tile needs beyond its own outputs, shared with neighbor blocks</td></tr>
+  <tr><td>AI / roofline / ridge</td><td>FLOPs per ideal byte / the two-ceiling performance model / the AI where the ceilings meet (~20.3 here)</td></tr>
+  <tr><td>effective bandwidth</td><td>ideal (must-move) bytes ÷ time — a score against perfection, not a traffic report</td></tr>
+  <tr><td>__constant__</td><td>64 KB read-only region with a per-SM cache that broadcasts warp-uniform reads and folds them into FMA operands</td></tr>
+  <tr><td>__restrict__</td><td>programmer's promise that a pointer's memory is reached only through it; unlocks the read-only load path</td></tr>
+  <tr><td>SASS / LDS / LDG / LDC / FFMA</td><td>the GPU's real assembly / shared-mem load / global load (.CI = read-only path) / constant-mem load / fused multiply-add</td></tr>
+  <tr><td>grid-stride loop</td><td><code>for (i = idx; i &lt; N; i += gridDim*blockDim)</code> — any N, bounded grid, coalesced</td></tr>
+  <tr><td>shuffle (<code>__shfl_down_sync</code>)</td><td>register-to-register exchange between lanes of a warp; no memory, no barrier</td></tr>
+</table>
+
+<h1><span class="chip">14</span>What comes next</h1>
+<ul>
+  <li><b>Histogram</b> — a new failure mode: thousands of threads <i>writing</i> to the same few
+  counters. Technique: privatization (per-block copies in shared memory, merged at the end).</li>
+  <li><b>Matmul double-buffering</b> — overlap the load of tile t+1 with computation on tile t;
+  the current 26% of fp32 peak says the FMA units are still waiting on tiles.</li>
+  <li><b>SpMV (CSR)</b> — irregular, data-dependent access: load balancing when rows have wildly
+  different lengths.</li>
+  <li><b>Conv2d register reuse</b> (optional revisit) — several outputs per thread to cut shared-memory
+  loads per FMA below 1; the current kernel's ~75%-of-time-in-LDS says that's where the next 2&times; lives.</li>
+</ul>
+<p style="margin-top: 18px; color: #52514e;">Interactive companions to these notes (open in any browser):
+<code>docs/register_tiled_matmul_viz.html</code>, <code>docs/bank_conflict_viz.html</code>,
+<code>docs/memory_hierarchy_occupancy_viz.html</code>, <code>docs/blelloch_scan_tree_viz.html</code>,
+<code>docs/conv2d_halo_tiling_viz.html</code>.</p>
+
+</body>
+</html>
