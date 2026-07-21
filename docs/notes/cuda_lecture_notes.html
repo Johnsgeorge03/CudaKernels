@@ -1674,10 +1674,50 @@ SSY 0x140 ;                        // divergence ahead — lanes will reconverge
 ISETP.GE.AND P0, PT, R9, R0, PT ;  // P0 = (threadIdx.x &gt;= tileSize)?  = loop entry test   (c)
 @P0 SYNC ;                         // lanes with nothing to load go wait at 0x140</code></pre>
 
-<p>The last two lines are the <code>for</code> loop's entry test. With 256 threads and a 258-slot
-tile no thread skips the loop in practice, but the compiler cannot know that, so the machinery is
-there: lanes that would fail the test immediately branch to the reconvergence address that SSY
-declared. Next, line (b) — and here is Pascal's 16-bit multiplier at work, three XMADs for one
+<p>The last three lines are the <code>for</code> loop's entry test, and they repay a slow reading,
+because every idea the rest of the kernel leans on appears here first. Start with what
+<code>P0</code> is. SASS has no persistent variable names — only registers and a handful of
+predicate slots — and the compiler reuses a slot the instant its value dies. This one
+<code>P0</code> is computed three separate times in this kernel, meaning three unrelated things:
+here it is the loop's entry test; inside the loop it becomes the per-lap in-range check of the
+previous section; after the barrier it becomes the final store guard behind <code>@P0 EXIT</code>.
+Same physical bit, three different questions; nothing carries between them. The test itself,
+<code>ISETP.GE.AND P0, PT, R9, R0, PT</code>, sets <code>P0</code> true when
+<code>threadIdx.x &gt;= tileSize</code> — the compiled form of the loop's opening condition
+<code>s &lt; tileSize</code>, asked once before the body runs. A subtlety worth stating plainly:
+for this kernel that test can <i>never</i> fire. <code>tileSize = blockDim.x + 2</code> is always
+larger than <code>blockDim.x</code>, which <code>threadIdx.x</code> never even reaches — so no
+lane is ever out of range. The compiler cannot prove that from the general shape of a
+<code>for</code> loop, so it emits the guard as insurance: two instructions per thread paid against
+a mathematically impossible case, a tiny free cousin of chapter 11's dead sixteen-wide fast path.</p>
+
+<p>Now the reconvergence machinery, and a genuine trap in reading it. <code>SSY 0x140</code>
+declares — it does not jump — "if this warp's lanes are about to disagree over the next stretch,
+they all regroup at <code>0x140</code>." That number is an offset <i>into this function's own
+instruction stream</i>: 0x140 bytes from the start of the kernel's code. It is emphatically
+<i>not</i> the <code>0x140</code> that appears a few instructions later inside
+<code>c[0x0][0x140]</code>, which is a constant-memory address (bank 0, where the <code>in</code>
+pointer lives, per &sect;12.2). Same four digits, two unrelated address spaces — a coincidence,
+since kernel arguments always begin at a fixed bank-0 offset and small functions have small code
+offsets, so such collisions are common and mean nothing. (On this chip the count is even
+finer-grained than it looks: instructions come in groups of three plus one hidden 8-byte
+scheduling word, and 0x140 lands on such a word, so the reconvergence point resolves to the next
+real instruction, the NOP at 0x148 — where control genuinely resumes.)</p>
+
+<p>With the declaration in place, <code>@P0 SYNC</code> is the action: lanes where <code>P0</code>
+is true execute it as a real jump <i>now</i>, straight to the regroup point, skipping the entire
+loop; lanes where <code>P0</code> is false ignore it and fall through into the body. The reason to
+declare the target once, up front, is that two different paths reconverge there — the (dead)
+fast-exit jump, and the ordinary path of running the loop to completion and dropping out its
+bottom. That second arrival is the unpredicated <code>SYNC</code> at the very end of the loop:
+a lane reaching the meeting point the normal way rather than by jumping early. Whichever route each
+lane took, only once <i>all</i> of them have arrived at 0x140 does the warp resume as one unit into
+the barrier-and-compute sequence. This is the same SSY/SYNC pattern the per-lap bounds check uses,
+just declared closer to its use (<code>SSY 0x120</code>) and with <code>P0</code> recomputed; the
+after-barrier check skips SSY entirely and pairs its <code>P0</code> with <code>@P0 EXIT</code>,
+because a thread out of range there has nothing left to reconverge <i>for</i> — it simply stops.</p>
+
+<p>Next, line (b) — and here is Pascal's 16-bit multiplier at work, three XMADs for one
 32-bit multiply. The compiler starts the accumulate at &minus;1, getting the
 "<code>&minus; R</code>" of line (d) for free inside the multiply-add:</p>
 
