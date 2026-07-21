@@ -1790,6 +1790,35 @@ substantial instructions including a memory load, so branching around it is chea
 that do not need it, at the price of the SM serializing the two groups on the (rare) laps where a
 warp actually splits.</p>
 
+<p>It is worth stopping on <i>why</i> those two groups must take turns, rather than the skipping
+lanes and the loading lanes simply running at the same time — the natural question, and one whose
+answer is the deepest fact about this hardware. Your instinct is right: the two groups need
+different instructions, in a different order, and a warp can only follow one order at a time. The
+reason is that a warp has a <i>single</i> program counter — one marker for "the next instruction to
+run" — and a single instruction fetch-and-issue unit, both shared by all 32 lanes. In any one cycle
+the whole warp is issuing exactly one instruction, from one address in the code. The 32 lanes are
+not 32 small processors that could each sit at a different point in the program; they are 32
+arithmetic units wired to one controller, and the controller can point at only one instruction at a
+time. So "let the loading lanes run the block while the skipping lanes wait ahead" is not
+physically expressible: being "ahead" would be a second position in the program, and there is only
+one position to be at. The hardware's only move is to hold one address, run it for the lanes that
+want it with the rest switched off and idle, then move to the other group's address. That is the
+serialization — not a policy the compiler chose, but a direct consequence of one program counter
+shared by thirty-two lanes.</p>
+
+<p>This one-controller design is the whole reason a GPU can afford so many arithmetic units: it
+spends its transistors on the lanes and shares a single instruction pipeline across them, where a
+CPU would spend them giving each execution unit its own control logic. The thousands of lanes are
+bought precisely by <i>not</i> giving each a private program counter. Divergence is the bill for
+that bargain, and &sect;2.7 works the general accounting — but here the bill is nearly nothing,
+because one of the two groups has no instructions to run at all. The skipping lanes' "path" is
+empty, so the turn spent on them costs only the reconvergence itself, and the one idle lane waits
+out just the four instructions of the load block before the warp is whole again. (Cards newer than
+this one — Volta onward — give each lane its own program counter, which lets divergent paths
+interleave and avoids some deadlocks, but even there the datapath is shared, so the two sides still
+never fire in the same cycle. Serializing divergent work is intrinsic to any design that shares one
+instruction pipe across many lanes.)</p>
+
 <p>And "actually splits" undersells how rare it is here. Warp 0 (threads 0&ndash;31) on lap 1 is
 the only warp in this launch where it happens at all: lane 0 has <code>g = -1</code> and takes the
 jump, lanes 1&ndash;31 have <code>g = 0..30</code>, all in range, and fall through — one lane
