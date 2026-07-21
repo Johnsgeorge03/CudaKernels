@@ -1712,14 +1712,63 @@ STS [R7], R2 ;                               // tile[s] = value — store to sha
 @!P1 BRA 0x90 ;                              // not the last lap → go around again         (c)
 SYNC ;                                       // loop done — reconverge at SSY 0x140's target</code></pre>
 
-<p>Three details deserve a pause. First, the loop increment and the exit test happen <i>early</i>,
+<p><b>A concrete lap, to make the listing hand-traceable.</b> Take block 0, 256 threads,
+<code>n = 1000</code>. Then <code>blockStart = 0</code> and <code>tileSize = 258</code>, and
+thread 0 is the thread to follow, because it visits both branches of the <code>if</code>. Its
+first lap has <code>s = 0</code>, so the input index the loop wants is
+<code>blockStart - 1 + s = -1</code> — out of range, so <code>tile[0] = 0.0</code>: this is the
+left halo, the ghost cell before the array begins. The loop increment then sets <code>s = 256</code>,
+still under <code>tileSize = 258</code>, so there is a second lap: <code>s = 256</code> gives
+input index <code>255</code>, which is in range, so <code>tile[256] = in[255]</code>. One thread,
+two laps, "pad then load" — the two halves of line (d)'s <code>if</code>, taken back to back.</p>
+
+<p>Walking the SASS with those numbers substituted removes the abstraction. On lap 1,
+<code>R4 = -1</code> (fixed for the whole loop) and <code>R5 = 0</code>: <code>IADD R3,R4,R5</code>
+gives <code>R3 = g = -1</code>; the first ISETP asks "g &gt;= 1000?" (false); <code>SHL</code>
+computes the byte offset of <code>tile[0]</code>; the loop increment sets <code>R5 = 256</code>
+for next time; the second ISETP asks "g &lt; 0?" and ORs it in — now true, out of range;
+<code>R2</code> is set to 0.0; and because the out-of-range predicate P0 is true,
+<code>@P0 SYNC</code> is a jump this lane actually takes, landing directly at the reconvergence
+point with <code>R2</code> still 0.0 — the address math and the load below never execute for it.
+<code>STS</code> then writes <code>tile[0] = 0.0</code>. On lap 2, <code>R5</code> arrives holding
+the 256 the previous lap already computed: <code>R3 = g = 255</code>; both ISETPs come back false,
+so P0 stays false; <code>@P0 SYNC</code> is a no-op for this lane, which instead falls through into
+the address arithmetic and <code>LDG.E</code>, overwriting <code>R2</code> with
+<code>in[255]</code>; its own <code>SYNC</code> is where it catches up to the reconvergence point;
+<code>STS</code> writes <code>tile[256] = in[255]</code>.</p>
+
+<p>That pairing of <code>@P0 SYNC</code> and the bare <code>SYNC</code> that follows the load is
+worth naming precisely, because it is not the predication of chapter 2.7 — it is real warp-level
+branching. <code>SSY 0x120</code> tells the warp "if you split from here, everyone regroups at
+0x120." <code>@P0 SYNC</code> is a <i>predicated jump</i>: lanes where P0 is true execute it and
+land at the regroup point immediately, skipping the SHR/ISCADD/IADD.X/LDG block entirely — not
+predicated-and-discarded, simply never reached. Lanes where P0 is false ignore that jump and fall
+through into the block instead, meeting the others at the plain <code>SYNC</code> once their load
+completes. Chapter 2.7's examples predicated every instruction of a small guarded body, because
+for a one- or two-instruction body that costs less than a branch; here the guarded body is four
+substantial instructions including a memory load, so branching around it is cheaper for the lanes
+that do not need it, at the price of the SM serializing the two groups on the (rare) laps where a
+warp actually splits.</p>
+
+<p>And "actually splits" undersells how rare it is here. Warp 0 (threads 0&ndash;31) on lap 1 is
+the only warp in this launch where it happens at all: lane 0 has <code>g = -1</code> and takes the
+jump, lanes 1&ndash;31 have <code>g = 0..30</code>, all in range, and fall through — one lane
+diverges, thirty-one don't, and the SM pays for both groups once. Warp 1 (threads 32&ndash;63) on
+the same lap has <code>g = 31..62</code>, comfortably in range for all 32 lanes: P0 is false
+everywhere, nobody takes the jump, and the warp executes as a single uniform path with no
+divergence cost whatsoever. Every interior warp in the grid behaves like warp 1; only the handful
+of warps straddling an image boundary ever split, and even then the skipped side is nearly free,
+because skipping is all it does.</p>
+
+<p>Four details deserve a pause. First, the loop increment and the exit test happen <i>early</i>,
 in the middle of the body — the compiler hoists independent work upward so no instruction has to
 wait on its neighbor; source order is a suggestion, dependency order is the law. Second, the
 64-bit address arithmetic: every <code>in[g]</code> costs a three-instruction sandwich
 (SHR / ISCADD with carry-out / IADD.X with carry-in) because index arithmetic is 32-bit but
 pointers are not. Third, count the cost of the bounds check on line (d): two ISETPs, plus the
 divergence bookkeeping around the load. Chapter 11 called this the "instruction tax," and here it
-is, itemized.</p>
+is, itemized. Fourth, that divergence bookkeeping is real control flow, not predication — and on
+this kernel it is nearly free, because only boundary-straddling warps ever pay for it.</p>
 
 <p><b>The barrier and the payoff.</b> After the loop, the barrier, then the three taps. This is
 the excerpt that justifies the whole chapter — compare it to source line (h):</p>
