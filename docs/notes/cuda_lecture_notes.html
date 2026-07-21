@@ -1829,6 +1829,39 @@ divergence cost whatsoever. Every interior warp in the grid behaves like warp 1;
 of warps straddling an image boundary ever split, and even then the skipped side is nearly free,
 because skipping is all it does.</p>
 
+<p>Stepping through what the controller actually does at <code>@P0 SYNC</code> makes the mechanism
+concrete, and answers a natural question: the split cannot be decided until every lane has its
+<code>P0</code>, so what happens at that exact instant? First, note that computing <code>P0</code>
+is <i>not itself</i> divergent — the two ISETP instructions run in every active lane, each writing
+its own true/false bit into its own predicate register, all in lockstep. No decision has been made
+yet. The decision happens one instruction later, at <code>@P0 SYNC</code>, when the controller
+inspects all 32 of those bits at once against the warp's <b>active mask</b> (the register naming
+which lanes are currently live). If every active lane's <code>P0</code> agrees, nothing diverges:
+all-false and the warp falls through into the block together; all-true and it jumps to the join
+together. Only a genuine disagreement splits the warp — which is why the interior warps of the
+previous paragraph pay nothing.</p>
+
+<p>When it does split, here is the bookkeeping, and it is essentially the picture you would draw.
+The earlier <code>SSY 0x120</code> had pushed an entry onto a small per-warp hardware stack,
+recording the join address and the full set of lanes due to arrive there. At <code>@P0 SYNC</code>
+the controller sets the syncing lanes (<code>P0</code> true) aside — it clears their bits from the
+active mask and leaves them <i>parked</i> at the join, registers untouched — and keeps issuing
+instructions for only the remaining lanes (<code>P0</code> false), which run the address math and
+the <code>LDG</code> under the reduced mask. When those lanes reach their own unconditional
+<code>SYNC</code> at the bottom of the block, they too arrive at the join; the controller sees that
+everyone recorded on the stack entry is now present, restores the active mask to the full set, pops
+the entry, and resumes at the join (the <code>STS</code>) with all lanes live again. So your
+description — mask one set and proceed, then mask the other and proceed — is <b>exactly right for a
+two-sided branch</b>: an <code>if/else</code> whose two arms both contain real work runs as one
+masked pass then the other, which is the literal reason divergence costs the sum of both paths.
+This <code>@P0 SYNC</code>, though, is a <i>one-sided</i> branch: the block is the only body, and
+the syncing lanes have no instructions of their own — their "path" from the split to the join is
+empty. So the controller makes only one pass of real work here; the parked lanes cost nothing
+beyond the wait, which is the mechanical reason this divergence is nearly free. (This is the
+pre-Volta model precisely: one active mask plus a reconvergence stack that <code>SSY</code> pushes
+and <code>SYNC</code> pops. The newer per-lane-program-counter hardware mentioned earlier bookkeeps
+differently, but still issues one side's instructions at a time.)</p>
+
 <p>Four details deserve a pause. First, the loop increment and the exit test happen <i>early</i>,
 in the middle of the body — the compiler hoists independent work upward so no instruction has to
 wait on its neighbor; source order is a suggestion, dependency order is the law. Second, the
