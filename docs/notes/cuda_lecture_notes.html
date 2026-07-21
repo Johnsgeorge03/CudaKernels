@@ -1811,9 +1811,13 @@ is, itemized. Fourth, that divergence bookkeeping is real control flow, not pred
 this kernel it is nearly free, because only boundary-straddling warps ever pay for it.</p>
 
 <p><b>The barrier and the payoff.</b> After the loop, the barrier, then the three taps. This is
-the excerpt that justifies the whole chapter — compare it to source line (h):</p>
+the excerpt that justifies the whole chapter. The very first line is where the SSY 0x140 target
+above finally lands — the lone <code>NOP</code> at address 0x148, the reconvergence pad both
+loop-exit paths meet on — after which, compare the rest to source line (h):</p>
 
-<pre><code>XMAD R4, R6, c[0x0][0x8], R9 ;         // start i = blockIdx.x*blockDim.x + threadIdx.x  (i)
+<pre><code>0x148:
+NOP ;                                  // ← SSY 0x140's landing pad: every lane regroups here
+XMAD R4, R6, c[0x0][0x8], R9 ;         // start i = blockIdx.x*blockDim.x + threadIdx.x  (i)
 BAR.SYNC 0x0 ;                         // __syncthreads()                                (g)
 MEMBAR.CTA ;                           // …with its block-scope memory fence
 XMAD.MRG R3, R6, c[0x0][0x8].H1, RZ ;  // (multiply, part 2)
